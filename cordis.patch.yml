@@ -1,0 +1,12 @@
+# dsh-attention-group bundle patch: mounted as one insert over the profile root.
+#
+# One row: the chat itself. Room ledger, durable message log, attention routing,
+# wake-up delivery, and the group panel all live in the host half.
+#
+# Default posture is OFF for every wake-up path. Installing this plugin alone
+# never lets a group message start a turn in another session: routing rules,
+# keyword subscriptions, and wake permissions are all opt-in, per group, through
+# the panel or this row's config.
+- insert:
+    - id: attention-group
+      name: 'dsh-attention-group'

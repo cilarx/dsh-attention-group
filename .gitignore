@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# node_modules is ignored EXCEPT for one committed file tree.
+#
+# `node_modules/@deepseek-ai/dsh-tools/` is a two-file development shim that
+# re-exports `test/support/dsh-tools-shim.js`. It is committed on purpose: it is
+# what lets `node --test test/*.test.js` run on a fresh clone with no DSH profile
+# installed, because Node resolves `@deepseek-ai/dsh-tools` from there. Ignoring
+# it would make the test suite unrunnable for anyone who just cloned the repo.
+#
+# The `dir/*` + `!dir/name` form is required: `node_modules/` alone makes git skip
+# the directory entirely, so a later `!` re-inclusion inside it has no effect.
+# ---------------------------------------------------------------------------
+node_modules/*
+!node_modules/@deepseek-ai
+node_modules/@deepseek-ai/*
+!node_modules/@deepseek-ai/dsh-tools
+
+# `npm pack` writes these next to package.json unless you pass --pack-destination.
+*.tgz
+
+# Throwaway output from tools/smoke-real-data.mjs --keep, and stray ledger copies.
+smoke-*/
+*.conclusions.md
+
+# Scratch space for adversarial audit probes. Never part of the deliverable.
+_tmp_attack/
+
+# Editor and OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

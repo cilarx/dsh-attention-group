@@ -1,0 +1,431 @@
+# dsh-attention-group
+
+**一个会闭嘴的 DSH 多智能体群聊：决定谁值得被叫醒。**
+
+一个给多个 DSH 会话（以及你自己）用的持久群：消息**先落盘、再路由、最后**才被允许叫醒谁。
+一条无关的消息，成本是 **0 个 turn**。
+
+---
+
+## 为什么不是"又一个群聊"
+
+所有群聊都在**投递时**花预算：先把所有人叫醒，然后每个被叫醒的成员自己发现"这条不是给我的"。
+一条本不需要任何人回应的消息 = N 个 turn。
+
+本插件把这个判断挪到**叫醒之前**。发一条消息，返回的是路由计划：
+
+```
+routing: SILENT — nobody matched, zero turns spent
+```
+
+或者
+
+```
+routing: 1 recipient(s) — plan only, nothing woken
+  room-admin	mention	not-woken (dry run)
+```
+
+唤醒是**第二**个显式动作，而且需要**两个**开关同时同意（见
+[唤醒是两个开关](#唤醒是两个开关)）。
+
+三条推论在本项目里是【设计规则】而不是巧合：
+
+- **建群、拉人、读历史、发言，一律不叫醒任何人。**
+- **在面板上点任何东西都不叫醒任何人。** 人在自己的面板里打字不是一个"事件"。
+- **不调用任何别的插件。** 群、聊天记录、结论、导出全是普通文件 —— 所以它在白板 DSH 上可用，
+  而且删掉本插件之后文件还在。
+
+---
+
+## 30 秒上手
+
+### 前置条件
+
+- DSH **0.2.0-rc.2**（这里每一个接口都是对着这个版本核实的）。
+- 一个可以装进去的 profile。下文示例用 `--profile desktop`。
+
+### 这个包还没有发布到 npm
+
+写作本文时**没有已发布的 npm 包**（以后是否会变，`unverified`）。所以
+`dsh plugin --profile desktop add dsh-attention-group` 只有在它**已经发布或已经打包之后**才可用；
+今天你只能按路径从这份源码目录安装。等某个版本真的上了 npm，用裸包名的同一条命令就是预期路径
+（在真的发生之前，这一条是 `unverified`）。
+
+### 安装
+
+从源码目录（也就是含本 `package.json` 的那个目录）安装：
+
+```bash
+dsh plugin --profile desktop add "J:\路径\到\dsh-attention-group"
+```
+
+目录路径、tarball、git URL 都行，因为 `dsh plugin` **本身就是**包管理：它在 profile 目录里把命令
+交给 `pnpm`（不带子命令跑一次 `dsh plugin --profile <名字>`，回给你的就是 pnpm 自己的帮助）。让它
+成为插件的，是 `package.json` 里声明了 `dsh.bundle.patch`。
+
+tarball 安装已端到端实测：
+
+```bash
+npm pack --pack-destination /tmp
+dsh plugin --profile 一个全新名字 add /tmp/dsh-attention-group-0.1.0.tgz
+# → dsh: initialized profile 一个全新名字 at ~/.dsh/profiles/一个全新名字
+```
+
+装完之后，那个新 profile 的 `package.json` **自己**把契约的两半都写上了 —— 依赖 **和** bundle 层：
+
+```json
+{ "dependencies": { "dsh-attention-group": "file:...tgz" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-attention-group"] } } }
+```
+
+并且从那个 profile 内部 import 装好的副本是**成功**的，`@deepseek-ai/dsh-tools` 从共享的
+`~/.dsh/profiles/node_modules` 解析到。也就是说：**一个全新的 profile 能加载这个插件** ——
+"白板 DSH 插上就能用"指的就是这个。
+
+**`link:` 依赖和 Windows 目录联接（junction）都会失败**（你的机器上 `unverified`，本机 2026-10-16
+实测失败）。Node 按模块的**真实路径**解析 import，所以一个在 profile 之外的链接副本，也会到
+profile 之外去找 `@deepseek-ai/dsh-tools`：
+
+```
+attention-group (dsh-attention-group): failed to import
+ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-tools'
+```
+
+解决办法就是把**实体副本**装进 profile。
+
+### 核实安装是否登记成功
+
+`~/.dsh/profiles/<profile>/package.json` 里必须有**两处**出现这个包 —— 只在 `dependencies` 里的包
+是"装上了"，但**不是 profile 层**，什么都不会发生：
+
+```json
+{
+  "dependencies": { "dsh-attention-group": "..." },
+  "dsh": { "profile": { "bundles": [ "...", "dsh-attention-group" ] } }
+}
+```
+
+### 必须重启 DSH —— 这一步没有替代方案
+
+宿主侧代码（`src/index.js` 等）只在启动时加载一次。在插件面板里开关**不会**重新导入模块：
+本机实测，新增的工具在开关一次之后仍然是 `unknown tool`，重启后才出现。装完 → 重启 → 在侧边栏
+找「群聊」。
+
+### 开发环回（源码树 → 运行中的 profile）
+
+由于上面那条"真实路径"规则，改这份源码**改不到 DSH 加载的东西**。`tools/sync-plugin.ps1` 会把包
+复制进 profile，然后**导入那份副本**证明它还能加载：
+
+```powershell
+pwsh -File tools/sync-plugin.ps1
+```
+
+### 第一个 60 秒
+
+1. 侧边栏 →「群聊」→「＋」→ 给群起名。
+2. 设置页 → 只在你**确实**希望群消息能启动 turn 的时候，把「唤醒」打开。
+3. 设置页 → 拉人：贴一个会话 id（`session-<uuid>` **或** 裸 `<uuid>`，两种都是真的）才是
+   **可唤醒**的；用任意稳定 id + kind `user` / `admin` / `bot` / `liaison` 则是群里的一个"名字"。
+4. 在那个会话里让 agent 调 `attention_group_list`，再调 `attention_send` 并且**不带** `wake` ——
+   你会拿到计划，而没有人被打扰。
+
+### 确认运行时是健康的
+
+调用 `attention_probe` 工具。它会报出数据目录、群数量、当前可见的活会话、这个部署提供了哪些可选
+服务、最近 5 次唤醒尝试及其走的路径，以及面板路由的状态（`registered`，或者它没注册的**确切原因**）。
+"面板挂了却渲染成『你还没有群』"正是这一行要防的事故。
+
+---
+
+## 核心概念
+
+### 群
+
+一个群 = JSON 账本里的一条记录 + 一份 append-only 的 JSONL 聊天记录。它有从标题生成的 id
+（`插件工程协调-fpab`）、标题、群规、成员表、路由模式、**一个**群级推理强度旋钮、四个沉淀设置，
+以及一份对外的沟通员（link）列表。
+
+### 成员种类
+
+| kind | 是什么 | 能被叫醒吗 |
+|---|---|---|
+| `session` | 一个 DSH 会话，用它的会话 id 标识。 | 能 —— 活会话或冷恢复。 |
+| `user` | 人。面板就是以这个成员身份行动。 | 不能 —— 只记录。 |
+| `admin` | 群自带管理员。「总结今天」这类请求默认找第一个启用的 `admin`。 | 不能 —— 除非它同时是个会话 id。 |
+| `bot` | 任何非会话的自动参与者。 | 不能 —— 只记录。 |
+| `liaison` | 为群间沟通员预留的种类（见[沟通员](#沟通员r10)）。 | 不能 —— 只记录。 |
+
+**会话 id 有两种真实形状**：`session-<uuid>` 和**裸 `<uuid>`**。2026-10-16 在真实运行时上实测：
+`008bda70-4811-4349-a1a5-d6c6ff54d7d1` 是一个 stored、可恢复、路由可读的真会话 —— 而且开发本插件
+那台机器上**大多数**会话都长这样。本插件早期版本要求必须带 `session-` 前缀，结果**悄悄让约七十个真
+会话变得无法唤醒**；现在两种形状都接受。
+
+**只有看起来像会话 id 的成员才可唤醒**；面板给每行标「可唤醒」或「只记录」，所以一个永远无法
+恢复的成员不会被配上一个按了也没用的开关。叫醒一个会话的含义是：活会话收到一次 followup；
+**已存储**的会话被冷恢复，用的是**它自己的** provider/model 和**它自己的**成员 preset。
+preset 这件事很要紧 —— 不带它恢复会悄悄把该会话的工具集换成部署默认（本机实测过），这也是冷路径
+要先读会话 `agentPreset` 投影的原因。而推理强度由群说了算：成员的 `wakeEffort` 优先，其次是群的
+`defaultEffort`，两者都没设时，会话自己上次用的强度才会保留下来。
+
+### 群规
+
+群上的一段自由文本。它会被带进被叫醒成员收到的消息里，也会被写进聊天记录导出、被摘要引用。
+默认为空。
+
+### 注意力路由
+
+| 模式 | 面板文案 | 做什么 |
+|---|---|---|
+| `rules` | 规则 | 只按规则：`@名字` 点名，或命中订阅词。**不匹配 = 零唤醒。** 这是默认值。 |
+| `classify` | 语义 | 先走规则；规则判不出来的部分作为 `greyZone` **回报给调用方**（发消息的那个模型）去判断。路由本身**绝不会**把灰区偷偷变成全量广播，也不会自己花掉一次模型调用。 |
+| `broadcast` | 全体 | 先走规则，然后把所有启用成员都叫醒。最贵的模式，也就是老式群聊的行为。 |
+
+每个路由计划里都会给出 `reason`：`mention`（被点名）、`keyword`（命中订阅词 —— 纯子串、大小写
+不敏感，或 `/正则/flags`）、`broadcast`（模式兜底）、`admin`、`summary`（`attention_summarize` 的
+直接指派，绕过相关性匹配但仍受群的唤醒开关约束）。
+
+**发送者永远不会被自己的消息叫醒**；一条消息里即使多条规则同时命中，一个成员也**只会被叫醒一次**。
+
+### 唤醒是两个开关
+
+只有**两个都为真**时才会真的发生唤醒：
+
+1. 调用方要求了 —— `attention_send` / `attention_summarize` 的 `wake=true`，或沟通员 link 的
+   `wake`。
+2. 目标群开着 —— 面板里的「唤醒」（`wakeEnabled`），默认关。
+
+转发的消息需要 link 的 `wake` **和**目标群的 `wakeEnabled`。没发生时，结果会直接告诉你**缺的是
+哪个开关**，而不是让你猜。
+
+有两个操作**刻意完全在唤醒体系之外**：`attention_conclude` 和 `attention_export` 只写文件 + 记一条
+群记录，不叫醒任何人 —— **沉淀不等于发言**。
+
+### 沟通员（R10）
+
+沟通员（liaison）是挂在**发送方群**上的一条**有向**链路："这个群里发生了某事时，把它带到那个群去"。
+模式：`conclusion`（默认 —— 只有被明确沉淀为结论的消息才转发）、`keyword`、`mention`、
+`all`（消防水管，请有意为之）。
+
+**防环是整个设计的难点**：转发出去的消息带着它走过的群名单，每一条防线都是纯函数、都有名字：
+
+- 目标群已经在名单里 → 拒绝；
+- 这条消息就是从目标群来的 → 拒绝；
+- 名单长度到了 link 的 `maxHops`（默认 3）→ 拒绝；
+- 一个群不能链到自己。
+
+所以无论链路怎么摆，A→B→A 都不可能发生。每次拒绝都会连**原因**一起报出来。
+
+---
+
+## 工具表
+
+宿主侧一共注册 **12 个工具**。
+
+| 工具 | 做什么 | 关键参数 |
+|---|---|---|
+| `attention_probe` | 运行时诊断：数据目录、群数量、活会话、可选服务、最近 5 次唤醒尝试、面板路由状态。 | *（无）* |
+| `attention_probe_session` | 某一个会话能不能被唤醒：活的还是存储的、它存下来的 route、以及"唤醒会做什么"。除非你要真恢复，否则只读。 | `sessionId`（必填）、`resume`（布尔，默认 false —— **会花 token**，它会真的启动一个 agent 循环） |
+| `attention_group_create` | 建群。立刻写盘；不叫醒任何人；创建者自动入群。 | `title`（必填）、`charter`、`wakeEnabled`（默认 false） |
+| `attention_group_list` | 本会话所在的群，每个带本会话的未读数和新消息预览。群有自己的记录，任何东西都不会被推进你的会话。 | *（无）* |
+| `attention_group_join` | 拉人进来，或更新一个已有成员。这里的拒绝是**权限答复**不是 bug：由群的 `joinPolicy` 决定。 | `groupId`（必填）、`memberId`（必填）、`memberName`、`kind`、`subscribe`、`wakeEffort` |
+| `attention_send` | 发消息：先进持久记录，再路由，然后返回计划。除非 `wake=true` **且**群开着唤醒，否则不叫醒任何人。 | `groupId`（必填）、`text`（必填）、`wake`（布尔，默认 false） |
+| `attention_history` | 从最早开始读群的记录，并把读取者标记为已读。 | `groupId`（必填）、`limit`（默认 20，上限 200） |
+| `attention_conclude` | 把**一条结论**沉淀进该群自己的 Markdown 文件，并追进群记录。不叫醒任何人。 | `groupId`（必填）、`text`（必填）、`author` |
+| `attention_export` | 把某时间段的聊天记录写成 Markdown 文件，并报出**真实路径**。永不覆盖已有文件，永不叫醒任何人。 | `groupId`（必填）、`since`、`until`（ISO-8601）、`limit`、`path` |
+| `attention_digest` | **不调模型、不叫醒任何人**地总结一段时间：条数、谁说了几条、沉淀了哪些结论、以及消息本身。这是"总结"的免费那一半。 | `groupId`（必填）、`range`（`today` / `24h` / `all`，默认 `all`）、`since`、`until`、`limit`（默认 50，上限 180） |
+| `attention_summarize` | 请一个成员（默认是群里第一个启用的 `kind=admin`）写一份总结。现成的摘要**装在请求里**发过去，所以被叫醒的成员**一轮**就能写完。 | `groupId`（必填）、`range` / `since` / `until`、`limit`（默认 80）、`memberId`、`wake`（默认 false） |
+| `attention_link` | 管理本群的沟通员。不带 `to` 调用就是列出它们。有向、防环、默认只记录不叫醒。 | `groupId`（必填）、`to`、`mode`（默认 `conclusion` / `keyword` / `mention` / `all`）、`keywords`、`wake`、`enabled`、`maxHops`（默认 3）、`remove` |
+| `attention_effort` | 设置本群的统一强度旋钮，或某个成员的覆盖值 —— 带 `live: true` 时还会**立刻**改活着的会话。 | `groupId`（必填）、`effort`（必填：`off` / `low` / `high` / `max` / `""`）、`memberId`、`live`（默认 false） |
+
+`range: "today"` 是**本地时区**的今天零点到现在（不是 UTC），因为人说"今天"就是这个意思。
+显式给了 `since`/`until` 时，它们永远压过 `range`。
+
+**每个工具的结果都有体积上限**：tool result 会被 replay 进该会话之后的**每一次**请求，所以投影被
+夹在 200 行以内，截断时会**明说**截断了多少。持久记录本身从不截断 —— 被限制的只是模型可见的那份
+投影。
+
+---
+
+## 面板
+
+侧边栏一个全局「群聊」入口（id `attention-group`，order 40）打开面板。浏览器侧不持有任何状态：
+打开时问一次宿主、之后每 5 秒问一次，所以两个窗口不可能对同一个群有不同看法。
+
+**左列群列表：** 群总数与消息总数、总未读、「＋」建群；每个群一行，带未读徽标、人数/条数、唤醒是否
+开着，以及最新消息的发言人和预览。**读取失败会被显式报成失败**，就报在列表的位置 —— 绝不会被渲染成
+「还没有群」。
+
+**聊天页：** 群规、消息流（最新在下、自动滚到底、最多渲染最新 300 条）、一条
+「总结今天」/「最近24小时」/「全部」的摘要栏（点了不叫醒任何人，还有「收起」）、以及一个以「用户」
+身份发言的输入框（`@名字` 可点名，Enter 发送、Shift+Enter 换行）。**面板自己发言永远不叫醒任何人。**
+
+**设置页：**「群名称」、「唤醒」、「推理强度（群统一）」（滑块）、「路由模式」、「自省」、「群规」、
+「拉人权限」、「结论沉淀」（开关、真实结论文件路径、条数、落地目录、「导出这个群的记录」、
+「同时写任务记忆」）、「沟通员（对外转发）」（每条 link 的模式、「停用」/「启用」、「改为只记录」/
+「改为叫醒」、「移除」，以及目标群选择器）、「成员」（每人「休眠」/「启用」、「移出」（需二次确认）、
+订阅词、个人强度），以及「这个群的记录在哪」。
+
+**打开一个群 = 入群 + 标记已读。** 面板打开时会 POST `{"action":"read"}`；宿主在需要时补上 `user`
+成员并盖 `lastReadAt`。发言也会推进你自己的已读位置，所以你不会因为自己说话而把徽标越养越大。
+
+---
+
+## 配置项全表
+
+每个开关都是**群级**的，存在 `groups.json` 里，面板和工具都能设。
+
+| 设置 | 默认值 | 可选值 | 含义 |
+|---|---|---|---|
+| `title` | ——（必填） | 任意文本 | 显示名。改名不改群 id，也不动聊天记录。 |
+| `charter` | `''`（空） | 任意文本 | 成员被叫醒时会在消息里看到这段。 |
+| `routeMode` | `rules` | `rules` / `classify` / `broadcast` | 判断"谁相关"要花多少功夫。 |
+| `wakeEnabled` | `false` | `true` / `false` | 群的总闸。关着时路由照样算、照样报，但一个 turn 都不会被启动。 |
+| `selfReflect` | `true` | `true` / `false` | 让被叫醒的成员先便宜地判断要不要发言；不需要就只回一行。 |
+| `joinPolicy` | `members` | `open` / `members` / `user` / `nobody` | 谁能拉人。用户 id 永远放行 —— 一个人把自己锁在自己群外面，是设计失职。 |
+| `defaultEffort` | `''` | `''` / `off` / `low` / `high` / `max` | 群的**唯一**推理强度旋钮（R4b）。`''` = 这个群不干预 —— 成员自己没设 `wakeEffort` 时，沿用该会话上次用的强度，什么都不强加给任何人。 |
+| `liveEffort` | `false` | `true` / `false` | 这个群能不能顺手改**此刻活着**的会话的强度。默认关：背后那个调用会把这次选择**同时存成部署默认模型**。需要部署有 `sessionController`；`attention_probe` 会报 `liveEffortControl`。 |
+| `sinkEnabled` | `true` | `true` / `false` | 是否允许把结论沉淀成文件。 |
+| `sinkDir` | `''` | 任意路径 | 这个群的文件落到哪。`''` = 插件自己的 `sink/`；相对路径相对数据目录解析，绝对路径原样使用。 |
+| `sinkMemory` | `false` | `true` / `false` | 打开后，结论的输出里会多一句**请调用方**（如果它的部署有这种工具）也写进任务记忆。不按名字调用任何东西。 |
+| 成员 `name` | id 前 12 个字符 | 任意文本 | `@提及` 用的名字。 |
+| 成员 `kind` | `session` | `session` / `user` / `admin` / `bot` / `liaison` | 这个成员是什么。 |
+| 成员 `subscribe` | `[]` | 词条列表 | 正文含任一词条就叫醒这个人。纯文本或 `/正则/flags`。 |
+| 成员 `wakeEffort` | *（未设）* | `off` / `low` / `high` / `max` | 这个成员自己的覆盖值；未设 = 用群里的 `defaultEffort`，群也没设就沿用它自己上次的。 |
+| 成员 `enabled` | `true` | `true` / `false` | 关 = 休眠：不被叫醒，也不占额度。 |
+| link `to` | ——（必填） | 一个群 id | 消息被带进哪个群。 |
+| link `mode` | `conclusion` | `conclusion` / `keyword` / `mention` / `all` | 这条沟通员愿意带什么。 |
+| link `keywords` | `[]` | 词条或名字列表 | `keyword` 用的关键词、`mention` 要盯的名字。 |
+| link `wake` | `false` | `true` / `false` | 是否也把**目标群内部**被命中的成员叫醒。目标群的唤醒开关也必须开着。 |
+| link `enabled` | `true` | `true` / `false` | 不删除地关掉一条沟通员。 |
+| link `maxHops` | `3` | 正整数 | 一条消息最多经过几个群，之后链路停止携带。 |
+
+---
+
+## 数据落在哪
+
+全部在 `$DSH_HOME/attention-group/` 下（正常安装即 `~/.dsh/attention-group/`）：
+
+```
+groups.json                        群账本：群、成员、群规、各开关、沟通员
+messages/<groupId>.jsonl           每个群一份 append-only 聊天记录，一行一条 JSON
+messages/deliveries.jsonl          唤醒审计：每次尝试、走的哪条路径、为什么
+sink/                              默认沉淀目录
+sink/<groupId>.conclusions.md      该群的结论，逐条追加，一条一个列表项
+sink/<groupId>-<时间戳>.md         聊天记录导出（永不覆盖已有文件）
+```
+
+几个要紧的细节：
+
+- 账本是**原子替换**（写临时文件再 rename），所以崩溃不会留下写了一半的群列表。账本**损坏**时会被
+  改名成 `groups.json.corrupt-<ts>` 放到一边并**被报告**，绝不静默丢弃。
+- 聊天记录每次追加后立即关文件句柄。
+- 唤醒审计是**第三方见证**：投递报告成功、目标日志却一动不动，是最难诊断的故障，所以每一次尝试都
+  连路径（`live-followup`、`cold-resume`、`skipped`、`non-session`、`dry-run`）和原因一起记下来。
+- JSONL 末尾被撕坏的一行会被跳过，而不是让整段历史变成不可读。
+
+### "群记录不进任何人的会话上下文"
+
+严格表述是：**一个群的聊天记录不是任何会话上下文的一部分。** 消息追加进群自己的 JSONL，路由从账本
+算出来；单纯发言、读列表、在面板上点击，都不会往任何人的对话里加任何东西。一个会话只有在**它主动
+要**（`attention_history`、`attention_digest`、`attention_group_list` 的一行预览）或者**有人明确
+把一个唤醒投递给它**时才会看到群内容 —— 而唤醒恰恰是唯一一个必须先让两个开关都同意的事。
+
+---
+
+## 已知限制
+
+写在这里是因为它们是真的，不是因为它们小：
+
+- **DSH 版本。** 这里的一切都在 **DSH 0.2.0-rc.2** 上核实过。本插件的接口形状只对这个版本负责；
+  更新的 DSH 版本可能会挪动它读的那些服务。
+- **宿主侧改动必须重启。** 安装或改宿主代码之后需要重启；在插件面板里开关**不会**重新导入模块
+  （实测：新工具一直是 `unknown tool`）。浏览器侧是**磁盘快照** —— 它改动后需要刷新页面，而一次刷新
+  可能发生在宿主进程重启**之前**，这也是面板选择"降级但不崩"的原因。
+- **推理强度要改到"正在跑的会话"，得你主动开，而且只有挂了 web-app 的部署才行。** **已存储**的会话
+  在被叫醒时会自动用上群里的强度，不用管。**活着的**会话也能就地改 —— `sessionController.selectModel`
+  确实存在、确实管用 —— 但它挂在一个群级开关 `liveEffort` 后面，而且**默认是关的**：因为同一个调用
+  会**顺带把这次选择存成部署默认模型**。它在会话的**下一个 step** 生效，不是当前在飞的这次请求。而且
+  `sessionController` 是 `@deepseek-ai/dsh-web-app` 挂的：没有 web-app 的部署根本没有它，这种情况下
+  面板会**直说**，而不是假装那个开关有用。
+  （`unverified`：这个调用在源码层面已核实、也有对着替身服务的测试；但**还没有在一台真机的活会话上
+  实测过**。）
+- **跨工作区唤醒"机制已实现，真机未验"。** 成员可以是任意会话 id，已存储的会话会用**它自己的**
+  route 和 preset 冷恢复 —— 但端到端验证过的目标是**本工作区**的会话。叫醒一个属于**别的**工作区的
+  会话还没有在真实目标上验证过（`unverified`）。不过目标已经找到了：本机有 3 个非本工作区、可读路由
+  的真会话（`D:\环境安装区` 与 `.dsh\bot\workspace` 各一个，`.dsh\profiles\desktop` 下十一个），
+  `attention_probe_session` 对它们都报 stored + 路由可读。就算失败也是**看得见的失败**：
+  `attention_probe_session` 会报 `wouldDo`，审计会记下路径和原因。
+- **没有会话持久化的部署会失去冷路径。** 如果 `sessionQuery` 不存在，已存储会话的 route 读不出来，
+  唤醒会被明确拒绝（`no route could be resolved`），而不是静默什么都不做。至于"最小部署能否正常加载
+  其余全部能力"，这一条是 `unverified`；可选服务一律用 `ctx.get()` 探测、绝不声明成硬依赖，所以缺一个
+  最多只会牺牲它自己那项功能。
+- **DSB 联动明确搁置。** DSB 还在大量破坏性更新，所以没有做任何 DSB 支持；`liaison` 成员种类只是为它
+  预留的位置。除此之外关于 DSB 没有任何承诺。
+- **面板只做了结构性断言。** 面板测试是把**真实的浏览器侧 bundle** 灌进 React 替身里跑，所以"哪个
+  控件存在、点下去发什么"是被断言的 —— 像素、布局、CSS 不在断言范围内，这个面板不是截图验收的 UI。
+
+---
+
+## 开发
+
+```powershell
+pwsh -File tools/run-tests.ps1
+```
+
+它跑整套测试并只打印一行摘要。**它会先同步**，因为测试加载的是**已安装进 profile 的那份副本**，
+而不是这份源码树 —— 所以改完源码直接跑它，测的就是你刚写的东西。加 `-NoSync` 可以跳过复制这一步。
+
+**还没装 DSH 也能跑。** 新克隆下来的仓库没有 profile，这时测试会退回到**这份源码树**，靠
+`node_modules/@deepseek-ai/dsh-tools` 这个**两文件的开发 shim** 完成解析 —— 它就是为了这个才被
+提交进仓库的（由 `test/support/entry.mjs` 决定哪一份是权威副本，`.gitignore` 专门把那一个目录
+重新纳入）。脚本会**告诉你它用了哪一份**，不用你猜：
+
+```
+note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
+```
+
+当前状态：脚本里列的 **8 个套件 111/111 通过** —— 无论对着已安装副本、还是对着一份**完全没有 DSH**
+的源码树（本机 2026-10-16 实测，约 4 秒）。
+
+### 拿你自己的数据做冒烟测试
+
+```bash
+node tools/smoke-real-data.mjs
+```
+
+单元测试自己造数据，所以它证明的是"代码在测试编出来的数据上没问题"。这一个证明的是它在
+**你自己的数据**上没问题：它把 `$DSH_HOME/attention-group` 复制到一个临时目录，让插件指向那份
+副本，然后把每个工具都走一遍 —— 路由、沉淀一条结论、摘要、导出、建沟通员、触发一次防环拒绝、
+请求一次总结、动一次强度旋钮、读一次历史、探测一次会话。
+
+**你的真账本是只读的。** 脚本会在运行前后各算一次哈希，有一个字节变了就判失败，并把这条检查
+作为最后一行打印出来：
+
+```
+36 passed, 0 failed
+YOUR DATA IS UNTOUCHED (…\attention-group hash 08c718998427…)
+```
+
+参数：`--empty` 改成从空账本开始，`--keep` 保留临时副本供检查。它**不需要 DSH 在运行** —— 所以
+它也是"改完宿主侧代码该跑的那个检查"，因为那些改动在 DSH 重启之前没法从活运行时里验。
+
+这些套件是**分层**的，不是凑数：
+
+| 套件 | 证明什么 |
+|---|---|
+| `test/router.test.js` | 路由：谁值得被叫醒，以及一条普通消息谁都不叫醒。 |
+| `test/tools.test.js` | 工具契约：输出能过 schema，且 `render` 只返回类型化分块。 |
+| `test/panel-host.test.js` | 真实 web 路由：读模型、每个动作、落盘往返、权限拒绝。 |
+| `test/panel-client.test.js` | 真实 `client.js` 跑在 React 替身上：哪个控件存在、点下去发什么。 |
+| `test/sink.test.js` | 结论落盘：只增不改、导出永不覆盖、任务记忆那句话的两个分支。 |
+| `test/digest.test.js` | 时间范围（含本地午夜边界）、体积上限、一次性总结的交接。 |
+| `test/relay.test.js` | 沟通员：A→B→A 被拒、`maxHops` 截断链路、默认不叫醒任何人。 |
+
+插件直接用 Node 的 `fs` 而不是某个存储服务，所以除了声明为可选 peer 的 DSH 包之外，
+**零运行时依赖**。没有构建步骤：`exports` 直接指向源码。
+
+---
+
+## 许可
+
+MIT。见 [LICENSE](./LICENSE)。
