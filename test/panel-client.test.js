@@ -743,32 +743,40 @@ test('the panel renders the REAL host read model, and a drag lands in the ledger
   }
 })
 
-test('every CSS variable the panel reads is a real DSH theme token', () => {
-  // A wrong token name is INVISIBLE: `var(--typo, <fallback>)` silently uses the
-  // fallback, so the panel never follows the light/dark theme and nothing fails.
-  // That is exactly what shipped: `--dsh-border`, `--dsh-surface-2` and
-  // `--dsh-accent` do not exist in DSH 0.2.1 (measured 2026-10-17 with the Theme
-  // inspect provider — the string `--dsh-accent` does not appear in app.asar at
-  // all, while the real prefix `--dsw-alias-*` does). The allowlist below is that
-  // provider's token list; a new token must be added here deliberately.
-  const TOKENS = new Set([
-    '--dsw-alias-bg-base',
+test('a theme token is only used where its VALUE fits the role', () => {
+  // ⚠️ Lesson paid for on 2026-10-17, with the user staring at a broken panel:
+  // a token's NAME is not evidence about its VALUE. Read the definitions out of
+  // app.asar before using one:
+  //   --dsw-alias-brand-primary = var(--dsw-static-neutral-bluish-1000)
+  //       → a CONTRAST colour (near-black in light, near-white in dark), not an
+  //         accent. As a "filled button" background it painted near-white blocks
+  //         under `color:#fff` text: the 保存 button, the + and the selected
+  //         segment became invisible.
+  //   --dsw-alias-bg-layer-2 = var(--dsw-static-neutral-bluish-00)
+  //       → pure WHITE in the light theme. As a chip background it turned every
+  //         neutral surface into an opaque white slab.
+  // So neutral surfaces stay translucent greys (they adapt to any background by
+  // construction) and the accent stays the literal brand blue. Only the two
+  // STATE colours are tokenised: the app itself writes
+  // `color: var(--dsw-alias-state-error-primary)` for exactly that role.
+  const FORBIDDEN = [
+    '--dsw-alias-brand-primary',
     '--dsw-alias-bg-layer-1',
     '--dsw-alias-bg-layer-2',
-    '--dsw-alias-bg-overlay',
-    '--dsw-alias-border-l1',
-    '--dsw-alias-border-l2',
-    '--dsw-alias-brand-primary',
-    '--dsw-alias-label-primary',
-    '--dsw-alias-label-secondary',
-    '--dsw-alias-state-error-primary',
-    '--dsw-alias-state-idle-primary',
-    '--dsw-alias-state-success-primary',
-    '--dsw-alias-state-warn-primary',
-    '--dsw-specific-sidebar-fill',
-  ])
+    '--dsw-alias-bg-layer-3',
+    '--dsw-alias-brand-',
+    '--dsh-',
+  ]
+  for (const token of FORBIDDEN) {
+    assert.ok(
+      !SOURCE.includes(`var(${token}`),
+      `${token} does not mean what it looks like — see the comment above before using it`,
+    )
+  }
+  const ALLOWED = new Set(['--dsw-alias-state-error-primary', '--dsw-alias-state-warn-primary'])
   const used = [...SOURCE.matchAll(/var\((--[A-Za-z0-9-]+)/g)].map((match) => match[1])
-  assert.ok(used.length > 0, 'the panel should be themed by the deployment, not only by literals')
-  const unknown = [...new Set(used)].filter((token) => !TOKENS.has(token))
-  assert.deepEqual(unknown, [], `unknown theme token(s): ${unknown.join(', ')}`)
+  const unvetted = [...new Set(used)].filter((token) => !ALLOWED.has(token))
+  assert.deepEqual(unvetted, [], `unvetted theme token(s): ${unvetted.join(', ')}`)
+  // And the accent must still be a colour, not a token that might resolve to white.
+  assert.ok(SOURCE.includes('#4d6bfe'), 'the brand accent must stay a literal colour')
 })
