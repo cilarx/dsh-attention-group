@@ -160,6 +160,40 @@ test('the summary button refuses clearly when the room cannot produce one', asyn
   assert.equal(host.delivered.length, 0, 'and nothing may be woken on the refusal path')
 })
 
+test('@所有人 is inert until the room allows it, and then it addresses the whole room', async () => {
+  boot()
+  const groupId = await newRoom('全体广播群')
+  const first = 'session-aaaa0001-0000-0000-0000-000000000001'
+  const second = 'session-bbbb0002-0000-0000-0000-000000000002'
+  await post({ action: 'join', group: groupId, memberId: first, memberName: '甲' })
+  await post({ action: 'join', group: groupId, memberId: second, memberName: '乙' })
+
+  const send = host.tool('attention_send')
+  const exec = { agent: { id: 'session-sender-0000-0000-0000-000000000003' } }
+
+  // Default OFF. The message is still posted; the phrase just stays plain text,
+  // and the answer names the gate that refused it (no silent downgrade).
+  const off = await send.execute({ groupId, text: '@所有人 开会' }, exec)
+  assert.equal(off.ok, true)
+  assert.equal(off.allMention, false)
+  assert.match(off.allMentionNote, /允许 @所有人/)
+  assert.equal(off.silent, true, 'with the switch off nobody is addressed')
+  assert.equal(host.delivered.length, 0)
+
+  await post({ action: 'mentionAll', group: groupId, mentionAll: true })
+  const on = await send.execute({ groupId, text: '@所有人 开会' }, exec)
+  assert.equal(on.ok, true)
+  assert.equal(on.allMention, true)
+  assert.equal(on.allMentionNote, undefined, 'a granted broadcast needs no excuse')
+  const addressed = on.recipients.map((row) => row.name)
+  assert.ok(
+    addressed.includes('甲') && addressed.includes('乙'),
+    `both members must be addressed, got ${addressed.join(',')}`,
+  )
+  assert.ok(on.recipients.every((row) => row.reason === 'broadcast'), 'and the reason is the broadcast reason')
+  assert.equal(host.delivered.length, 0, 'a dry run still wakes nobody')
+})
+
 test('the summary reminder counts un-summarised messages and never acts on its own', async () => {
   // The user's decision (2026-10-17): remind at a limit, but never compact by
   // itself. A summary costs a model turn in someone else's session, so the panel

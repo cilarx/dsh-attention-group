@@ -1811,6 +1811,23 @@ window.__ModuleLoader__.load({
               h(
                 Field,
                 {
+                  label: '允许 @所有人',
+                  value: tri(group.mentionAll),
+                  hint:
+                    '开：群里的人可以用 @所有人 一次点名全群（还是要开「唤醒」才真的叫）。' +
+                    '关：这条短语只是普通文字。默认关 —— 一个每人都能叫醒全群的群，没人受得了。' +
+                    '即使开了，能 @所有人 的也只有你（用户）和群管理。',
+                },
+                h(Switch, {
+                  value: group.mentionAll,
+                  onPick: function (value) {
+                    setKnob('mentionAll', { mentionAll: value })
+                  },
+                }),
+              ),
+              h(
+                Field,
+                {
                   label: '群史摘要提醒',
                   value: group.summary ? countOf(group.summary.every) + ' 条' : '—（宿主未报告）',
                   hint:

@@ -87,6 +87,37 @@ export function extractMentions(text, names) {
 }
 
 /**
+ * The tokens that mean "everybody in this room".
+ *
+ * `@所有人` is the Chinese group-chat convention; the English aliases exist so a
+ * mixed-language room has one obvious spelling. They are matched with the SAME
+ * Unicode boundary rule as member names (see `extractMentions`): `@所有人啊` is
+ * not a broadcast, and `@allison` is not `@all` — a room where one careless
+ * extension of a word wakes everybody is exactly the failure c14 recorded.
+ */
+export const MENTION_ALL_TOKENS = ['所有人', '全体成员', '全体', 'all', 'everyone']
+
+/**
+ * Does this text address the whole room?
+ *
+ * It answers a question about the TEXT only. Whether the sender is ALLOWED to
+ * address everyone, and whether the room opted in, is decided by the caller —
+ * the router must never turn a phrase into a permission.
+ *
+ * @param {string} text - message text.
+ * @returns {boolean} true when an `@所有人`-style token is present.
+ */
+export function hasMentionAll(text) {
+  if (typeof text !== 'string' || text.length === 0) return false
+  for (const token of MENTION_ALL_TOKENS) {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_@])@${escaped}(?![\\p{L}\\p{N}_-])`, 'iu')
+    if (pattern.test(text)) return true
+  }
+  return false
+}
+
+/**
  * Whether a member's subscription matches the message text.
  *
  * Matching is case-insensitive substring for plain terms. A term may also be
@@ -143,10 +174,25 @@ export function route(input) {
       : extractMentions(text, eligible.map((member) => member.name).filter(Boolean)),
   )
 
+  // Whether this message addresses the WHOLE room. The router does not decide who
+  // may say that — index.js sets `allMention` only after the room's own switch and
+  // the sender's kind both allow it, so an unauthorized phrase stays plain text.
+  const addressAll = input.message?.allMention === true
+
   const recipients = []
   const matched = new Set()
 
   for (const member of eligible) {
+    if (addressAll) {
+      recipients.push({
+        memberId: member.id,
+        name: member.name,
+        reason: REASON.broadcast,
+        detail: '@所有人',
+      })
+      matched.add(member.id)
+      continue
+    }
     if (mentioned.has(member.name)) {
       recipients.push({ memberId: member.id, name: member.name, reason: REASON.mention })
       matched.add(member.id)

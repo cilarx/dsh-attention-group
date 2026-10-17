@@ -211,11 +211,27 @@ prepended to transcript exports and quoted in digests. Empty by default.
 
 Reasons a member is chosen (`reason` in every routing plan): `mention` (named), `keyword`
 (a subscription term matched — plain substring, case-insensitive, or `/regex/flags`),
-`broadcast` (mode fallback), `admin`, `summary` (a direct assignment from
+`broadcast` (mode fallback, or an `@所有人` address), `summary` (a direct assignment from
 `attention_summarize`, which bypasses relevance matching but still respects the wake switch).
 
 A sender is never woken by its own message, and a member is woken at most once per message
 even when several rules match.
+
+### Addressing everyone: `@所有人`
+
+A message can address the whole room with `@所有人` (`@全体成员`, `@全体`, `@all`,
+`@everyone` work too). It is gated **twice**, and both gates belong to the room:
+
+- **`允许 @所有人` (off by default).** With it off the phrase is ordinary text: the
+  message is still posted, and the tool result tells the sender which gate refused it.
+  A room where every member can wake everyone is a room nobody can afford.
+- **Who may say it.** The human and the room's admins. A regular member's `@所有人`
+  stays plain text even when the switch is on.
+
+Even when it takes effect, waking still needs `wake=true` **and** the room's own wake
+switch: `@所有人` decides *who the message addresses*, never whether anyone is woken.
+The boundary rules are the same Unicode ones as member names, so `@所有人啊` and
+`@allison` are not broadcasts.
 
 ### Waking is two switches
 
@@ -574,7 +590,7 @@ used instead of leaving you to guess:
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-Current state: **197/197 passing across the 10 suites** the script lists, both against the
+Current state: **200/200 passing across the 10 suites** the script lists, both against the
 installed copy and against a source tree with no DSH at all (measured on this machine on
 2026-10-17, about 7 seconds).
 

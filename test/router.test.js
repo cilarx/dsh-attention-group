@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ROUTE_MODE, REASON, extractMentions, matchKeywords, route, renderWakeMessage } from '../src/router.js'
+import { ROUTE_MODE, REASON, extractMentions, matchKeywords, route, renderWakeMessage, hasMentionAll } from '../src/router.js'
 
 /** A group with three members and no overlap between their subscriptions. */
 function group(overrides = {}) {
@@ -277,4 +277,43 @@ test('the room charter reaches a woken member — it is the only way it can know
     selfReflect: false,
   })
   assert.doesNotMatch(bare, /这个群是干什么的/, 'no charter means no charter section')
+})
+
+test('@所有人 is recognised only as a whole token, never as a prefix', () => {
+  // The same c14 boundary rule as member names: a longer word must not become a
+  // broadcast. `@所有人啊` and `@allison` are exactly how that goes wrong.
+  assert.equal(hasMentionAll('@所有人 开会了'), true)
+  assert.equal(hasMentionAll('请 @全体成员 看一下'), true)
+  assert.equal(hasMentionAll('@全体 到这里'), true)
+  assert.equal(hasMentionAll('@all hands up'), true)
+  assert.equal(hasMentionAll('@Everyone please read'), true)
+
+  assert.equal(hasMentionAll('@所有人啊 开会'), false, 'a longer word is not a broadcast')
+  assert.equal(hasMentionAll('@allison 你好'), false, 'a name starting with all is not @all')
+  assert.equal(hasMentionAll('mail@all.example'), false, 'an address-like token is not a mention')
+  assert.equal(hasMentionAll('没有提到任何人'), false)
+  assert.equal(hasMentionAll(''), false)
+})
+
+test('an @所有人 message addresses every other member, and the plan says why', () => {
+  const plan = route({
+    group: group(),
+    message: { fromName: 'Alice', text: '@所有人 开会', mentions: [], allMention: true },
+    excludeMemberId: 's-a',
+  })
+  assert.equal(plan.silent, false)
+  assert.equal(plan.recipients.length, 2, 'everyone except the sender')
+  for (const row of plan.recipients) {
+    assert.equal(row.reason, REASON.broadcast)
+    assert.equal(row.detail, '@所有人')
+  }
+
+  // The router does not decide permissions: without the flag the same text is
+  // ordinary words and the plan stays silent.
+  const plain = route({
+    group: group(),
+    message: { fromName: 'Alice', text: '@所有人 开会', mentions: [] },
+    excludeMemberId: 's-a',
+  })
+  assert.equal(plain.silent, true, 'the phrase alone must not wake anybody')
 })

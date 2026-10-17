@@ -19,7 +19,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readLedger, writeLedger, appendMessage, readMessages, readMessagesWithStatus, resolveDataRoot, appendDelivery, readDeliveries, transcriptGroupIds } from './store.js'
-import { ROUTE_MODE, REASON, route, extractMentions } from './router.js'
+import { ROUTE_MODE, REASON, route, extractMentions, hasMentionAll } from './router.js'
 import { renderWakeMessage } from './router.js'
 import {
   sinkConclusion,
@@ -1955,12 +1955,23 @@ function registerTools(ctx, state) {
                 },
               },
             },
+            // The two @所有人 gates, published as facts: `allMention` says whether
+            // the message really addressed everyone; `allMentionNote` names the gate
+            // that refused it when the text asked and could not.
+            allMention: { type: 'boolean' },
+            allMentionNote: { type: 'string' },
             error: { type: 'string' },
           },
         },
         render: (_args, value) => {
           if (value.ok !== true) return textBlock(`failed: ${value.error ?? 'unknown error'}`)
           const lines = [`posted seq=${value.seq} to ${value.groupId} (route=${value.mode})`]
+          if (value.allMention === true) {
+            lines.push('mention: the whole room (@所有人) — every enabled member was addressed')
+          }
+          if (typeof value.allMentionNote === 'string' && value.allMentionNote.length > 0) {
+            lines.push(`mention note: ${value.allMentionNote}`)
+          }
           if (value.silent === true) {
             lines.push('routing: SILENT — nobody matched, zero turns spent')
           } else {
@@ -2003,6 +2014,28 @@ function registerTools(ctx, state) {
         const sender = group.members.find((member) => member.id === senderId)
         const mentions = extractMentions(text, group.members.map((member) => member.name))
 
+        // ⚠️ `@所有人` is the one phrase that can wake an entire room, so it is
+        // gated TWICE and the gate is decided here, not in the router:
+        //   - the room must opt in (`mentionAll`, default off), because a room
+        //     where every member can wake everybody is a room nobody can afford;
+        //   - the sender must be the human or a room admin, because "everybody"
+        //     is a megaphone and handing it to every member by default is how a
+        //     quiet room becomes noise.
+        // When either gate is shut the message is still posted — the phrase just
+        // stays plain text, and the answer SAYS which gate refused it (c7: no
+        // silent downgrade of a feature the sender believed in).
+        const askedAll = hasMentionAll(text)
+        const senderKind = typeof sender?.kind === 'string' ? sender.kind : sender === undefined ? 'user' : 'session'
+        const senderMayAddressAll = sender === undefined || senderKind === 'user' || senderKind === 'admin'
+        const allMention = askedAll && group.mentionAll === true && senderMayAddressAll
+        const allMentionNote = !askedAll
+          ? undefined
+          : allMention
+            ? undefined
+            : group.mentionAll !== true
+              ? 'text says @所有人, but 「允许 @所有人」 is off for this room — only the @-named members were addressed'
+              : '@所有人 was ignored: only the human and room admins may address everyone'
+
         const record = {
           seq: nextSeq(state.root, group.id),
           at: new Date().toISOString(),
@@ -2010,6 +2043,7 @@ function registerTools(ctx, state) {
           fromName: sender?.name ?? (senderId === undefined ? 'system' : String(senderId).slice(0, 12)),
           text,
           mentions,
+          ...(allMention ? { allMention: true } : {}),
         }
         appendMessage(state.root, group.id, record)
 
@@ -2069,6 +2103,10 @@ function registerTools(ctx, state) {
           woken: wantWake,
           recipients,
           relayed,
+          // Whether the message actually addressed the whole room, and — when the
+          // text asked for it but a gate refused — why (c7: no silent downgrade).
+          allMention: allMention === true,
+          ...(allMentionNote === undefined ? {} : { allMentionNote }),
         }
       },
     }),
@@ -3338,6 +3376,9 @@ function panelGroupDetail(state, group) {
     // R6: when this is on, a member sees "群聊未读：…" in its own system prompt on
     // every step, so it learns about waiting messages even when nobody woke it.
     promptUnread: group.promptUnread === true,
+    // R3+: may a member address the whole room with `@所有人`? Off by default: a
+    // room where everyone can wake everyone is a room nobody can afford.
+    mentionAll: group.mentionAll === true,
     // R9+: how many messages have no summary yet, and how many it takes for the
     // panel to NAG. The panel never generates anything on its own — a summary
     // costs a model turn, so it is always a deliberate click (2026-10-17).
@@ -3611,6 +3652,12 @@ async function applyPanelAction(state, body) {
     group.promptUnread = body?.promptUnread === true
     save()
     return done({ promptUnread: group.promptUnread })
+  }
+
+  if (action === 'mentionAll') {
+    group.mentionAll = body?.mentionAll === true
+    save()
+    return done({ mentionAll: group.mentionAll })
   }
 
   if (action === 'summaryEvery') {
