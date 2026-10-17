@@ -574,7 +574,7 @@ used instead of leaving you to guess:
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-Current state: **184/184 passing across the 10 suites** the script lists, both against the
+Current state: **197/197 passing across the 10 suites** the script lists, both against the
 installed copy and against a source tree with no DSH at all (measured on this machine on
 2026-10-17, about 7 seconds).
 
@@ -609,7 +609,7 @@ the history read, a session probe.
 byte changed, and it prints that check as its last line:
 
 ```
-36 passed, 0 failed
+38 passed, 0 failed
 YOUR DATA IS UNTOUCHED (…\attention-group hash 08c718998427…)
 ```
 

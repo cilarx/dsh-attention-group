@@ -504,7 +504,7 @@ pwsh -File tools/run-tests.ps1
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-当前状态：脚本里列的 **10 个套件 184/184 通过** —— 无论对着已安装副本、还是对着一份**完全没有 DSH**
+当前状态：脚本里列的 **10 个套件 197/197 通过** —— 无论对着已安装副本、还是对着一份**完全没有 DSH**
 的源码树（本机 2026-10-17 实测，约 7 秒）。
 
 ### 它是怎么被测的
@@ -533,7 +533,7 @@ node tools/smoke-real-data.mjs
 作为最后一行打印出来：
 
 ```
-36 passed, 0 failed
+38 passed, 0 failed
 YOUR DATA IS UNTOUCHED (…\attention-group hash 08c718998427…)
 ```
 

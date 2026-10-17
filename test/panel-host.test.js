@@ -91,6 +91,32 @@ test('an opted-in room announces its unread count in the member prompt, and only
   assert.equal(lineFor(memberId), '')
 })
 
+test('one tool result is capped in TOTAL characters, not only in lines', async () => {
+  // 200 lines x 2000 characters is 400,000 characters — roughly 100k tokens — and
+  // a line count alone would happily allow exactly that. A tool result is replayed
+  // into every later request of the session that asked for it, so the projection
+  // also has a total budget; it keeps the newest lines and says how many it dropped.
+  boot()
+  const groupId = await newRoom('大群')
+  const filler = 'x'.repeat(1900)
+  for (let i = 0; i < 40; i += 1) {
+    await post({ action: 'post', group: groupId, text: `MSG-${i} ${filler}` })
+  }
+  const history = host.tool('attention_history')
+  const value = await history.execute({ groupId, limit: 200 }, {})
+  const blocks = history.output.render({ groupId, limit: 200 }, value)
+  const total = blocks.reduce((sum, block) => sum + (typeof block.text === 'string' ? block.text.length : 0), 0)
+  assert.ok(total <= 61500, `one result must stay near the 60000-character cap, got ${total}`)
+  assert.ok(
+    blocks.some((block) => /omitted from this view/.test(String(block.text))),
+    'and it must say how many lines it dropped',
+  )
+  // The TAIL has to survive: for a transcript the newest lines are what a reader
+  // needs, so the budget drops from the FRONT.
+  assert.ok(blocks.some((block) => String(block.text).includes('MSG-39')), 'the newest line is kept')
+  assert.ok(!blocks.some((block) => String(block.text).includes('MSG-0 ')), 'the oldest line is the one dropped')
+})
+
 test('/group is a real human command, and typing it never wakes anybody', async () => {
   boot()
   const groupId = await newRoom('命令测试群')
