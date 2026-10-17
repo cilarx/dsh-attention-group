@@ -3598,9 +3598,12 @@ function panelState(state, wanted) {
  *
  * The human is a first-class member: creating a room, adding people, editing the
  * charter and turning every knob are things a person should be able to do
- * without asking an agent to do it for them. None of these actions wake anybody
- * — a click is not a reason to start a turn in someone else's session. Waking
- * stays behind `wake=true` AND the room's own `wakeEnabled`.
+ * without asking an agent to do it for them. Almost none of these actions wake
+ * anybody — a click is not a reason to start a turn in someone else's session.
+ * The ONE exception is a posted message that NAMES somebody while the room's
+ * 「唤醒」 switch is on (2026-10-18, user request): then exactly the named members
+ * are woken, and the panel says so on screen and reports who was woken. A plain
+ * note, a keyword match, or a room with waking off still wakes nobody.
  *
  * Every verb names itself explicitly, so a future action can never be silently
  * mistaken for "post a message", and every refusal says which value was wrong
@@ -3983,27 +3986,87 @@ async function applyPanelAction(state, body) {
     return done({ lastReadAt: member.lastReadAt, joined })
   }
 
-  // Default: post a message as the human. This never wakes anyone, however the
-  // room is configured — a person typing in their own panel is not an event.
+  // Default: post a message as the human.
+  //
+  // ⚠️ 2026-10-18 (user request, replaces the old unconditional promise): a panel
+  // message that NAMES somebody now really wakes them — but only when the room's
+  // own 「唤醒」 switch is on. The rule the panel states on screen is:
+  //   · 唤醒 off              -> nothing is ever woken (a click is not an event);
+  //   · 唤醒 on + @到人        -> exactly those members are woken, like
+  //                              `attention_send` with wake=true;
+  //   · 唤醒 on + @所有人      -> the whole room is woken, when the room also has
+  //                              「允许 @所有人」 on (the same two gates as the tool);
+  //   · 唤醒 on + 没点名       -> still nobody. A plain note stays a note.
+  // Keyword SUBSCRIBERS are deliberately never woken from the panel: typing a word
+  // is not addressing anybody, and a room where any stray word starts a turn is a
+  // room nobody can afford. That is the difference this plugin exists for.
   const text = typeof body?.text === 'string' ? body.text : ''
   if (text.trim().length === 0) return { ok: false, error: 'text is required' }
   const at = new Date().toISOString()
+  const mentions = extractMentions(text, group.members.map((member) => member.name))
+
+  // `@所有人` from the panel. The human is the one sender who is always allowed to
+  // address everyone (kind `user`), so the only gate left is the room's own
+  // switch. The DECISION is stored on the record; the router never re-reads text.
+  const askedAll = hasMentionAll(text)
+  const allMention = askedAll && group.mentionAll === true
+  const allMentionNote =
+    !askedAll || allMention
+      ? undefined
+      : 'text says @所有人, but 「允许 @所有人」 is off for this room — only the @-named members were addressed'
   const record = {
     seq: nextSeq(state.root, group.id),
     at,
     fromId: HUMAN_ID,
     fromName: HUMAN_NAME,
     text,
-    mentions: extractMentions(text, group.members.map((member) => member.name)),
+    mentions,
+    ...(allMention ? { allMention: true } : {}),
   }
   appendMessage(state.root, group.id, record)
   // The human has obviously seen their own message, so it must not come back as
   // unread. Without this the badge would grow every time they speak.
   const speaker = group.members.find((candidate) => candidate.id === HUMAN_ID)
-  if (speaker !== undefined) {
-    speaker.lastReadAt = at
-    save()
+  if (speaker !== undefined) speaker.lastReadAt = at
+
+  // Who this message actually ADDRESSES. Only these reasons may start a turn;
+  // `keyword` is a subscription, not an address, and the panel must not act on it.
+  const addressed = allMention === true || mentions.length > 0
+  const plan = route({ group, message: record, excludeMemberId: HUMAN_ID })
+  const recipients = []
+  let woken = 0
+  for (const target of plan.recipients) {
+    if (target.reason !== REASON.mention && target.reason !== REASON.broadcast) continue
+    const member = group.members.find((candidate) => candidate.id === target.memberId)
+    const row = {
+      name: target.name,
+      memberId: target.memberId,
+      reason: target.reason,
+      ...(target.detail === undefined ? {} : { detail: target.detail }),
+      delivered: false,
+    }
+    if (group.wakeEnabled !== true) {
+      row.note = 'waking is off for this room'
+      recipients.push(row)
+      continue
+    }
+    if (member === undefined) {
+      row.note = 'member vanished from the room between routing and delivery'
+      recipients.push(row)
+      continue
+    }
+    const outcome = await deliver(state.ctx, state, group, member, record, target)
+    row.delivered = outcome.delivered === true
+    if (outcome.note !== undefined) row.note = outcome.note
+    if (row.delivered) {
+      woken += 1
+      // A woken member is about to read the message, so it must not also keep it
+      // in its unread count (same rule `attention_send` applies).
+      member.lastReadAt = at
+    }
+    recipients.push(row)
   }
+  save()
 
   // R10: a message spoken in the panel is still a message in this room, so it
   // obeys the room's liaisons exactly like one sent through `attention_send` —
@@ -4012,7 +4075,18 @@ async function applyPanelAction(state, body) {
   // room's `wakeEnabled`), so this cannot turn a click into N turns.
   const relayed = await relayMessage(state.ctx, state, group, record)
 
-  return { ok: true, seq: record.seq, mentions: record.mentions, woken: false, relayed }
+  return {
+    ok: true,
+    seq: record.seq,
+    mentions: record.mentions,
+    addressed,
+    wakeEnabled: group.wakeEnabled === true,
+    woken,
+    recipients,
+    allMention: allMention === true,
+    ...(allMentionNote === undefined ? {} : { allMentionNote }),
+    relayed,
+  }
 }
 
 /** Cordis plugin entry point. */

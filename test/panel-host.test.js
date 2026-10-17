@@ -10,9 +10,12 @@
  *   - every action the panel can send lands somewhere durable;
  *   - an illegal value is refused by NAMING the legal ones (the panel renders the
  *     host's own table, so a refusal here means the two have drifted);
- *   - NO panel action ever wakes anybody. The plugin's whole reason to exist is
- *     that "a click is not a reason to start a turn in someone else's session",
- *     so `agents.resume` is wired to throw and every action is still exercised;
+ *   - waking from the panel is NARROW: with the room's 唤醒 switch on, a post
+ *     that NAMES somebody wakes exactly those people (2026-10-18, user request);
+ *     a plain note, a keyword hit, or a room with waking off wakes nobody. The
+ *     old blanket rule ("a click never starts a turn") was replaced because the
+ *     human needs @-addressing to reach the room — the two halves below pin the
+ *     new rule, including the half that must still stay silent;
  *   - `joinPolicy` is a real permission control for agents (R8), and a room whose
  *     record predates the field behaves like the default rather than falling open.
  *
@@ -27,7 +30,10 @@ import { join } from 'node:path'
 
 import { createHost } from './support/host-harness.mjs'
 
-const host = await createHost()
+/** The one participant this harness declares LIVE, so a wake-up can succeed. */
+const LIVE_JIA = 'session-aaaa1111-2222-3333-4444-555566667777'
+
+const host = await createHost({ liveSessions: [LIVE_JIA] })
 after(() => host.cleanup())
 
 // Thin aliases, so each test reads as a sequence of requests.
@@ -38,6 +44,17 @@ const get = (query) => host.get(query)
 const post = (body) => host.post(body)
 const ledgerOnDisk = () => host.ledgerOnDisk()
 const newRoom = (title) => host.newRoom(title)
+
+/** Every delivery attempt the plugin audited, oldest first. */
+function deliveryRows() {
+  const path = join(host.home, 'attention-group', 'messages', 'deliveries.jsonl')
+  if (!existsSync(path)) return []
+  return readFileSync(path, 'utf8')
+    .trim()
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line))
+}
 
 test('the panel route registers as an exact path', () => {
   boot()
@@ -343,7 +360,9 @@ test('a panel post appends a message, extracts mentions, and wakes nobody', asyn
   assert.equal(response.status, 200)
   assert.equal(response.json.seq, 1)
   assert.deepEqual(response.json.mentions, ['甲'], 'the panel must route the same way a tool call does')
-  assert.equal(response.json.woken, false)
+  assert.equal(response.json.addressed, true, 'the message DOES name somebody')
+  assert.equal(response.json.woken, 0, 'but this room has waking off, so nobody is woken')
+  assert.equal(response.json.recipients[0].note, 'waking is off for this room', 'and the reason is reported, not guessed')
 
   const lines = host.messagesOnDisk(groupId).trim().split('\n')
   assert.equal(lines.length, 1)
@@ -484,19 +503,72 @@ test('a nameless action is still a post, and an empty one is refused', async () 
   assert.match(noText.json.error, /title is required/)
 })
 
-test('no panel action can wake anybody, even when everything is switched on', async () => {
+test('with waking ON, a panel post wakes exactly the people it NAMES', async () => {
+  // 2026-10-18, user request: "打开唤醒，@ 到人，就真的叫醒他". The old blanket
+  // rule ("a click never wakes anybody") is replaced by this narrower one.
   boot()
-  const groupId = await newRoom('全开群')
-  await post({ action: 'join', group: groupId, memberId: 'session-aaaa1111-2222-3333-4444-555566667777', memberName: '甲' })
-  await post({ action: 'wake', wakeEnabled: true })
-  await post({ action: 'member', group: groupId, memberId: 'session-aaaa1111-2222-3333-4444-555566667777', subscribe: '部署' })
-  await post({ action: 'route', routeMode: 'broadcast' })
+  const groupId = await newRoom('点名群')
+  await post({ action: 'join', group: groupId, memberId: LIVE_JIA, memberName: '甲' })
+  await post({ action: 'join', group: groupId, memberId: 'session-99999999-8888-7777-6666-555544443333', memberName: '乙' })
+  await post({ action: 'wake', group: groupId, wakeEnabled: true })
 
-  // `agents.resume` throws in this harness, so any wake attempt fails the test.
-  const fired = await post({ action: 'post', group: groupId, text: '@甲 部署上线了' })
+  const before = host.delivered.length
+  const fired = await post({ action: 'post', group: groupId, text: '大家好 @甲 看一下' })
   assert.equal(fired.json.ok, true)
-  assert.equal(fired.json.woken, false)
-  assert.equal(existsSync(join(host.home, 'attention-group', 'messages', 'deliveries.jsonl')), false)
+  assert.equal(fired.json.addressed, true)
+  assert.equal(fired.json.woken, 1, 'exactly the named member — not the whole room')
+  assert.equal(host.delivered.length, before + 1, 'and a turn really started in that session')
+  assert.equal(host.delivered[host.delivered.length - 1].sessionId, LIVE_JIA)
+
+  const rows = deliveryRows().filter((row) => row.groupId === groupId)
+  assert.equal(rows.length, 1, 'every attempt is audited (third witness, c5)')
+  assert.equal(rows[0].delivered, true)
+  assert.equal(rows[0].memberId, LIVE_JIA)
+  assert.equal(rows[0].reason, 'mention')
+})
+
+test('with waking ON, a plain panel note and a keyword hit still wake nobody', async () => {
+  boot()
+  const groupId = await newRoom('闭嘴群')
+  await post({ action: 'join', group: groupId, memberId: LIVE_JIA, memberName: '甲' })
+  await post({ action: 'member', group: groupId, memberId: LIVE_JIA, subscribe: '部署' })
+  await post({ action: 'wake', group: groupId, wakeEnabled: true })
+
+  const before = host.delivered.length
+  const plain = await post({ action: 'post', group: groupId, text: '有人吗，随便说说' })
+  assert.equal(plain.json.woken, 0)
+
+  // A subscription matches, but a panel note that names nobody is not an
+  // address: waking a subscriber because a stray word appeared is exactly the
+  // noise this plugin exists to remove.
+  const keywordOnly = await post({ action: 'post', group: groupId, text: '部署上线了' })
+  assert.equal(keywordOnly.json.woken, 0)
+  assert.equal(host.delivered.length, before, 'no turn may start from a note nobody was addressed in')
+})
+
+test('@所有人 from the panel needs BOTH switches, exactly like the tool', async () => {
+  boot()
+  const groupId = await newRoom('广播群')
+  await post({ action: 'join', group: groupId, memberId: LIVE_JIA, memberName: '甲' })
+  await post({ action: 'wake', group: groupId, wakeEnabled: true })
+
+  // 「允许 @所有人」 is off by default, so the phrase stays plain text.
+  const off = await post({ action: 'post', group: groupId, text: '@所有人 开会了' })
+  assert.equal(off.json.allMention, false)
+  assert.match(off.json.allMentionNote, /允许 @所有人/)
+  assert.equal(off.json.woken, 0)
+
+  await post({ action: 'mentionAll', group: groupId, mentionAll: true })
+  const before = host.delivered.length
+  const on = await post({ action: 'post', group: groupId, text: '@所有人 开会了' })
+  assert.equal(on.json.allMention, true)
+  assert.equal(on.json.woken, 1)
+  assert.equal(host.delivered.length, before + 1)
+
+  // The decision lives on the record; the router never re-reads the text.
+  const rows = host.messagesOnDisk(groupId).trim().split('\n').map((line) => JSON.parse(line))
+  const last = rows[rows.length - 1]
+  assert.equal(last.allMention, true)
 })
 
 test('joinPolicy is a real permission control for agents (R8)', async () => {

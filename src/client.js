@@ -942,6 +942,130 @@ window.__ModuleLoader__.load({
       return { rows: rows.slice(0, MAX_MENTION_ROWS), total: total, omitted: Math.max(0, total - MAX_MENTION_ROWS) }
     }
 
+    /**
+     * The tokens that mean "everybody", mirroring `MENTION_ALL_TOKENS` in router.js.
+     *
+     * This is a duplicate on purpose: the browser bundle cannot import the host's
+     * router module, and the panel has to predict what the host will do so it can
+     * say 「发送并叫醒 10 人」 BEFORE the click. A drift test asserts the two lists
+     * agree (`test/panel-client.test.js`), so a token added on one side fails loudly.
+     */
+    var MENTION_ALL_TOKENS = ['所有人', '全体成员', '全体', 'all', 'everyone']
+
+    function escapeRegExp(value) {
+      return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    }
+
+    /** Does this draft address the whole room? Same Unicode boundary rule as the host. */
+    function draftAddressesAll(draft) {
+      if (typeof draft !== 'string' || draft.length === 0) return false
+      for (var index = 0; index < MENTION_ALL_TOKENS.length; index += 1) {
+        var pattern = new RegExp('(^|[^\\p{L}\\p{N}_@])@' + escapeRegExp(MENTION_ALL_TOKENS[index]) + '(?![\\p{L}\\p{N}_-])', 'iu')
+        if (pattern.test(draft)) return true
+      }
+      return false
+    }
+
+    /** Which members this draft names, using the host's own boundary rule. */
+    function draftMentions(draft, members) {
+      var found = []
+      if (typeof draft !== 'string' || draft.length === 0) return found
+      var names = []
+      ;(Array.isArray(members) ? members : []).forEach(function (member) {
+        var item = member !== null && typeof member === 'object' ? member : {}
+        var name = str(item.name, '')
+        if (name.length > 0) names.push(name)
+      })
+      // Longest first, so a name that is a prefix of another cannot win by accident.
+      names.sort(function (a, b) {
+        return b.length - a.length
+      })
+      names.forEach(function (name) {
+        if (found.indexOf(name) >= 0) return
+        var pattern = new RegExp('(^|[^\\p{L}\\p{N}_@])@' + escapeRegExp(name) + '(?![\\p{L}\\p{N}_-])', 'u')
+        if (pattern.test(draft)) found.push(name)
+      })
+      return found
+    }
+
+    /**
+     * Who a panel send would really wake, so the composer can say it before the
+     * click instead of after. Mirrors the host's rule: waking must be on for the
+     * room, and only NAMED people (or everyone, via @所有人 with the room switch)
+     * are woken. The human and disabled members are never targets.
+     */
+    function wakeTargetsOf(group, draft) {
+      var result = { count: 0, names: [], broadcast: false, addressed: false }
+      if (group === null || group.wakeEnabled !== true) return result
+      var members = Array.isArray(group.members) ? group.members : []
+      var named = draftMentions(draft, members)
+      var broadcast = draftAddressesAll(draft) && group.mentionAll === true
+      var chosen = []
+      members.forEach(function (member) {
+        var item = member !== null && typeof member === 'object' ? member : {}
+        if (item.isHuman === true || item.enabled === false) return
+        var name = str(item.name, '')
+        if (name.length === 0) return
+        if (broadcast || named.indexOf(name) >= 0) chosen.push(name)
+      })
+      result.names = chosen
+      result.count = chosen.length
+      result.broadcast = broadcast
+      result.addressed = broadcast || named.length > 0
+      return result
+    }
+
+    /**
+     * What the host actually did with a panel message.
+     *
+     * Reads the host's own `recipients`/`woken` answer instead of assuming that a
+     * 200 means somebody was woken (C-16: a sent POST is not a delivery).
+     */
+    function wakeResultNote(data) {
+      if (data === null || typeof data !== 'object') return ''
+      var rows = Array.isArray(data.recipients) ? data.recipients : []
+      var parts = []
+      var deliveredRows = []
+      var failedRows = []
+      rows.forEach(function (row) {
+        if (row !== null && typeof row === 'object' && row.delivered === true) deliveredRows.push(row)
+        else failedRows.push(row)
+      })
+      if (deliveredRows.length > 0) {
+        parts.push(
+          '已叫醒 ' +
+            deliveredRows.length +
+            ' 人：' +
+            deliveredRows
+              .map(function (row) {
+                return str(row.name, '?')
+              })
+              .join('、'),
+        )
+      }
+      if (failedRows.length > 0) {
+        var first = failedRows[0] !== null && typeof failedRows[0] === 'object' ? failedRows[0] : {}
+        parts.push(
+          '没叫醒 ' +
+            failedRows.length +
+            ' 人（' +
+            str(first.name, '?') +
+            '：' +
+            str(first.note, '宿主没有给出原因') +
+            (failedRows.length > 1 ? ' 等' : '') +
+            '）',
+        )
+      }
+      if (parts.length === 0 && data.addressed === true) {
+        parts.push(
+          '这条点名了人，但没有叫醒任何人：' +
+            (data.wakeEnabled === true ? '被点名的人无法唤醒或已休眠' : '这个群的「唤醒」是关的'),
+        )
+      }
+      if (typeof data.allMentionNote === 'string' && data.allMentionNote.length > 0) parts.push('@所有人 未生效：' + data.allMentionNote)
+      return parts.join('；')
+    }
+
     /** The panel body. */
     function GroupPanel() {
       var [state, setState] = useState({
@@ -1156,13 +1280,19 @@ window.__ModuleLoader__.load({
       function submit() {
         var text = draft.trim()
         if (text.length === 0 || state.group === null) return
+        var room = state.group
+        // Say what is about to happen BEFORE the request: waking ten sessions is
+        // the one panel action that costs ten turns, and the human is entitled to
+        // see that count before they pay for it.
+        var targets = wakeTargetsOf(room, text)
         setDraft('')
-        setPostNote('')
-        act({ action: 'post', group: state.group.id, text: text })
+        setPostNote(targets.count > 0 ? '正在叫醒 ' + targets.count + ' 人…' : '')
+        act({ action: 'post', group: room.id, text: text })
           .then(function (data) {
-            // C-07: the host relays panel messages too now, so its report of
-            // what left the room has to be shown, not assumed.
-            setPostNote(relayNote(data, state.linkTargets))
+            // C-07/C-16: the host relays panel messages too, and now it also
+            // reports who it woke — both have to be shown, not assumed.
+            var parts = [wakeResultNote(data), relayNote(data, state.linkTargets)]
+            setPostNote(parts.filter(function (part) { return part !== '' }).join('；'))
             return again()
           })
           .catch(fail)
@@ -1963,6 +2093,23 @@ window.__ModuleLoader__.load({
         var mentionRows = mention !== null && mentionMute === mentionKey ? [] : mentionList.rows
         var mentionSelected = mentionRows.length === 0 ? 0 : Math.min(mentionIndex, mentionRows.length - 1)
 
+        // 2026-10-18: the panel now really wakes the people it NAMES, but only
+        // when the room's 「唤醒」 switch is on — so the screen has to say which
+        // state it is in, and how many turns a send is about to spend.
+        var wakeTargets = wakeTargetsOf(group, draft)
+        var mentionAllNote =
+          group.mentionAll === true
+            ? ''
+            : '（「允许 @所有人」' + (group.mentionAll === false ? '是关的' : '状态宿主未报告') + '，所以 @所有人 只会存成普通文字。）'
+        var wakeNote =
+          group.wakeEnabled === true
+            ? '唤醒已开：这条消息 @ 到谁就真的叫醒谁' +
+              (wakeTargets.count > 0 ? '（现在会叫醒 ' + wakeTargets.count + ' 人：' + wakeTargets.names.join('、') + '）' : '') +
+              '；没 @ 人的消息仍然只进群记录，不打扰任何人。' +
+              mentionAllNote
+            : '面板里发言只进群记录，不叫醒任何人 —— 这个群的「唤醒」是关的。要叫醒被 @ 的人，先把右上角「唤醒」打开。'
+        var sendLabel = wakeTargets.count > 0 ? '发送并叫醒 ' + wakeTargets.count + ' 人' : '发送'
+
         var head = h(
           'div',
           { style: S.head },
@@ -1990,7 +2137,7 @@ window.__ModuleLoader__.load({
               // this panel. Waking needs a TOOL call carrying wake=true.
               title:
                 group.wakeEnabled === true
-                  ? '唤醒已开：只有工具调用带 wake=true 时才会真的叫醒成员；面板里发言只进群记录，不叫醒任何人'
+                  ? '唤醒已开：面板里 @ 到谁就真的叫醒谁（@所有人 还要「允许 @所有人」开着）；没 @ 人的消息仍然只进群记录'
                   : '唤醒已关：消息只进群记录，不打扰任何人的会话',
               onClick: toggleWake,
             },
@@ -2060,12 +2207,9 @@ window.__ModuleLoader__.load({
                 : null,
             ),
             digestText.length > 0 ? h('pre', { style: S.digestBox }, digestText) : null,
-            // C-08: the truth has to be in the VISIBLE text, not only a tooltip.
-            h(
-              'div',
-              { style: S.noteLine },
-              '面板里发言只进群记录，不叫醒任何人。要真的叫醒成员，得用 attention_send 且带 wake=true（这个群的唤醒开关也得是开的）。',
-            ),
+            // C-08, rewritten 2026-10-18: the truth has to be in the VISIBLE text,
+            // not only a tooltip — and the truth now depends on the room's switch.
+            h('div', { style: S.noteLine }, wakeNote),
             postNote !== '' ? h('div', { style: Object.assign({}, S.noteLine, { opacity: 1 }) }, postNote) : null,
             h(
               'div',
@@ -2106,7 +2250,7 @@ window.__ModuleLoader__.load({
                   // Grows with the draft up to six lines, then scrolls. Pure
                   // arithmetic, so it is testable and needs no DOM measurement.
                   rows: Math.min(6, Math.max(1, draft.split('\n').length)),
-                  placeholder: '以「用户」身份发言（Enter 发送，Shift+Enter 换行，打 @ 点名；不会叫醒任何人）',
+                  placeholder: '以「用户」身份发言（Enter 发送，Shift+Enter 换行，打 @ 点名）',
                   onChange: function (event) {
                     setDraft(event.target.value)
                     setMentionIndex(0)
@@ -2149,7 +2293,7 @@ window.__ModuleLoader__.load({
                     }
                   },
                 }),
-                h('button', { style: S.button, onClick: submit }, '发送'),
+                h('button', { style: S.button, onClick: submit }, sendLabel),
               ),
             ),
           )

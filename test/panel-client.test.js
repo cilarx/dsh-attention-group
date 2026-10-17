@@ -21,7 +21,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 import { mountPanel, findAll, textOf, findButton } from './support/panel-harness.mjs'
 import { createHost } from './support/host-harness.mjs'
@@ -134,6 +134,8 @@ const DETAIL = {
     title: 'Q群',
     charter: '',
     wakeEnabled: true,
+    // Q群 is the fixture that can really broadcast: waking on AND 「允许 @所有人」 on.
+    mentionAll: true,
     routeMode: 'broadcast',
     selfReflect: false,
     joinPolicy: 'user',
@@ -223,14 +225,16 @@ const CANDIDATES = {
  * @returns {Function} a fetch implementation.
  */
 function fakeHost(options = {}) {
-  const { fail, candidatesFail, candidatesMissing, patchDetail } = options
+  const { fail, candidatesFail, candidatesMissing, patchDetail, postResult } = options
   return (record) => {
     if (record.method === 'POST') {
       const body = record.body ?? {}
       const extra =
         body.action === 'digest'
           ? { total: 2, shown: 2, omitted: 0, text: '群：P群（`p-room-aaaa`）\n条数：2\n#1 10-16 18:00 用户：P的第一条' }
-          : {}
+          : body.action === 'post' && postResult !== undefined
+            ? postResult
+            : {}
       return Promise.resolve({
         ok: true,
         status: 200,
@@ -1052,12 +1056,17 @@ function mentionListOf(tree) {
   return findAll(tree, (node) => node.props?.['aria-label'] === '选择要 @ 的人')[0]
 }
 
-/** Open P群 and hand back the panel with its composer on screen. */
-async function openChat(options = {}) {
+/** Open a room by its list title and hand back the panel. */
+async function openRoom(title, options = {}) {
   const panel = await boot(options)
-  panel.click(findButton(panel.tree, 'P群'))
+  panel.click(findButton(panel.tree, title))
   await panel.settle()
   return panel
+}
+
+/** Open P群 and hand back the panel with its composer on screen. */
+async function openChat(options = {}) {
+  return openRoom('P群', options)
 }
 
 /** How many messages the panel actually sent to the host. */
@@ -1215,4 +1224,88 @@ test('a long member list is capped and the rest are counted', async () => {
   assert.equal(names.length, 8, 'the list is capped for readability')
   // 3 fixture members + 15 added + 所有人 = 19 targets; 12 shown, 7 left out.
   assert.match(textOf(list), /还有 7 个没列出来（共 19 个）/)
+})
+
+// ---------------------------------------------------------------------------
+// 2026-10-18 (user request): a panel message that NAMES somebody now really
+// wakes them — but only while the room's 「唤醒」 switch is on. The composer has
+// to say which state it is in, how many turns a send is about to spend, and
+// afterwards report what the host says it actually did.
+// ---------------------------------------------------------------------------
+
+test('with waking off, the composer still promises silence and the button stays 发送', async () => {
+  const panel = await openChat() // P群: wakeEnabled false
+  const shown = textOf(panel.tree)
+  assert.match(shown, /只进群记录/)
+  assert.match(shown, /这个群的「唤醒」是关的/)
+  panel.change(composerOf(panel.tree), '@甲 看一下')
+  assert.ok(exactButton(panel.tree, '发送') !== undefined, 'nothing will be woken, so no cost to show')
+  assert.equal(exactButton(panel.tree, '发送并叫醒 1 人'), undefined)
+})
+
+test('with waking on, the button names the cost and the note names the people', async () => {
+  const panel = await openRoom('Q群')
+  assert.match(textOf(panel.tree), /唤醒已开/)
+  panel.change(composerOf(panel.tree), '@丙 你好')
+  assert.ok(exactButton(panel.tree, '发送并叫醒 1 人') !== undefined, 'the human must see the cost BEFORE the click')
+  assert.match(textOf(panel.tree), /会叫醒 1 人：丙/)
+})
+
+test('@所有人 on a room that allows it counts the whole room', async () => {
+  const panel = await openRoom('Q群')
+  panel.change(composerOf(panel.tree), '@所有人 开会')
+  assert.ok(exactButton(panel.tree, '发送并叫醒 1 人') !== undefined)
+  // Q群 has exactly one member besides the human: 「丙」.
+  assert.match(textOf(panel.tree), /会叫醒 1 人：丙/)
+})
+
+test("the host's answer about who was woken is shown, not assumed", async () => {
+  const panel = await openRoom('Q群', {
+    postResult: {
+      addressed: true,
+      wakeEnabled: true,
+      woken: 1,
+      recipients: [{ name: '丙', reason: 'mention', delivered: true }],
+    },
+  })
+  panel.change(composerOf(panel.tree), '@丙 你好')
+  panel.click(exactButton(panel.tree, '发送并叫醒 1 人'))
+  await panel.settle()
+  assert.match(textOf(panel.tree), /已叫醒 1 人：丙/)
+})
+
+test("a failed wake is reported with the host's own reason", async () => {
+  const panel = await openRoom('Q群', {
+    postResult: {
+      addressed: true,
+      wakeEnabled: true,
+      woken: 0,
+      recipients: [{ name: '丙', reason: 'mention', delivered: false, note: 'cold resume failed: no route' }],
+    },
+  })
+  panel.change(composerOf(panel.tree), '@丙 你好')
+  panel.click(exactButton(panel.tree, '发送并叫醒 1 人'))
+  await panel.settle()
+  const shown = textOf(panel.tree)
+  assert.match(shown, /没叫醒 1 人/)
+  assert.match(shown, /no route/, "the host's reason must reach the human")
+})
+
+test('@所有人 without 「允许 @所有人」 is plain text, and the panel says why', async () => {
+  const panel = await openRoom('P群', { patchDetail: (detail) => ({ ...detail, wakeEnabled: true, mentionAll: false }) })
+  panel.change(composerOf(panel.tree), '@所有人 开会')
+  assert.equal(exactButton(panel.tree, '发送并叫醒 1 人'), undefined, 'no broadcast, and nobody is named')
+  assert.match(textOf(panel.tree), /「允许 @所有人」是关的/)
+})
+
+test("the panel's @所有人 tokens cannot drift from the host router's list", async () => {
+  // The browser bundle cannot import the host's router module, so the token list
+  // is duplicated. A drift test is the only thing that keeps the copy honest.
+  const routerSource = readFileSync(join(dirname(clientEntry), 'router.js'), 'utf8')
+  const tokensIn = (source) => {
+    const block = /MENTION_ALL_TOKENS\s*=\s*\[([^\]]*)\]/u.exec(source)
+    assert.ok(block !== null, 'the token list must exist')
+    return [...block[1].matchAll(/'([^']+)'/gu)].map((match) => match[1])
+  }
+  assert.deepEqual(tokensIn(SOURCE), tokensIn(routerSource), 'client.js and router.js must agree on @所有人')
 })

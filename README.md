@@ -32,11 +32,12 @@ Waking is a second, explicit step, and it needs **two** switches to agree (see
 
 Three consequences that are design rules here, not accidents:
 
-- **Creating a room, adding members, reading history and posting never wake anybody.**
-- **Clicking anything in the panel wakes nobody** — with one deliberate exception,
-  「生成群史摘要」, which asks the room's manager to write a summary, and only while the room's
-  「唤醒」 switch is on (see [Room-history summaries](#room-history-summaries-r9)). A person typing
-  in their own panel is not an event; a person asking for a summary is.
+- **Creating a room, adding members, reading history, exporting and summarising never wake anybody.**
+- **A panel message that names nobody wakes nobody** — only NAMING somebody (`@name`, or `@所有人`
+  while the room has 「允许 @所有人」 on) **and** the room's 「唤醒」 switch being on makes the panel
+  wake those people. Beyond that, the only panel action that starts a turn is 「生成群史摘要」 (also
+  gated on 「唤醒」 — see [Room-history summaries](#room-history-summaries-r9)). No name, no event:
+  a person typing in their own panel is not a reason to run somebody else's session.
 - **Nothing calls another plugin.** Rooms, transcripts, conclusions and exports are plain
   files, so this works on a bare DSH and survives this plugin being uninstalled.
 
@@ -410,7 +411,12 @@ waking anybody (and a 「收起」 button), and a **multi-line** composer that s
 **Enter sends, Shift+Enter makes a newline** (an Enter that is merely committing a Chinese IME
 candidate never sends), and typing `@` opens a completion list — every member name plus
 「所有人」 (`↑`/`↓` to move, `Enter`/`Tab` to fill, `Esc` to dismiss, or just click a row).
-The panel's own post never wakes anyone.
+**Whether that post wakes anybody depends on exactly two things**: whether the room's 「唤醒」 switch
+is on, and whether the message names somebody. Switch off — nothing happens, and the line under the
+composer says so. Switch on — the `@`-named members are woken, `@所有人` additionally needs
+「允许 @所有人」, and a message that names nobody still only lands in the record. The send button
+states the cost first (「发送并叫醒 N 人」) and afterwards reports who the host really woke
+(「已叫醒 N 人：…」, or the failure and its reason).
 
 **Settings tab:** 「群名称」, 「唤醒」, 「推理强度（群统一）」 (a slider), 「路由模式」, 「自省」,
 「未读写进系统提示」, 「群史摘要提醒」 (关 / 200 条 / 500 条 / 2000 条), 「群规」,

@@ -154,10 +154,12 @@ export async function createHost(options = {}) {
             },
           }
         },
-        // A panel action that tries to wake anybody is a bug, so make it loud.
-        // Tests that DO expect a delivery declare the target live instead.
+        // Cold resume is deliberately not modelled: a test that wants to prove a
+        // REAL wake declares the target in `liveSessions` and gets the
+        // live-followup path above. A stored target that is woken lands here and
+        // is reported as a failed delivery — an honest answer, not a silent one.
         resume: () => {
-          throw new Error('a panel action tried to resume a session')
+          throw new Error('cold resume is not modelled by this harness (declare the target in liveSessions instead)')
         },
       },
       get(name) {

@@ -568,21 +568,22 @@ test('C-07 a refused relay reports the host’s reason instead of silence', asyn
 // C-08: 「唤醒 开」 must not promise something the panel cannot do
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('C-08 the wake wording says a panel message wakes nobody', async () => {
+test('C-08 the wake wording now says a panel message really wakes the people it names', async () => {
+  // Rewritten 2026-10-18 (user request): the old promise was "a panel message
+  // wakes nobody", and the panel said so on screen. The new rule is narrower and
+  // is what the screen must state: waking on + @ 到人 = that person is woken;
+  // no @ = still nobody.
   const panel = await mount()
   panel.click(findButton(panel.tree, '乙群')) // wakeEnabled: true
   await panel.settle()
 
   const button = findButton(panel.tree, '唤醒 开')
   assert.ok(button !== undefined, 'a room with waking on must still say so')
-  assert.match(button.props.title, /面板里发言/u)
-  assert.match(button.props.title, /不叫醒任何人/u)
-  assert.doesNotMatch(button.props.title, /被 @ 或命中订阅词的成员会被真的叫起来跑一轮/u, 'that sentence was false for anything typed here')
-
-  const composer = findAll(panel.tree, (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
-  assert.match(composer.props.placeholder, /不会叫醒任何人/u)
-  assert.match(textOf(panel.tree), /不叫醒任何人/u, 'and the truth must be VISIBLE, not only in a tooltip')
-  assertNoLeaks(textOf(panel.tree), 'wake wording')
+  assert.match(button.props.title, /@ 到谁就真的叫醒谁/u)
+  const shown = textOf(panel.tree)
+  assert.match(shown, /唤醒已开/u, 'and the truth must be VISIBLE, not only in a tooltip')
+  assert.match(shown, /没 @ 人的消息仍然只进群记录/u)
+  assertNoLeaks(shown, 'wake wording')
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
