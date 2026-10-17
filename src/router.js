@@ -14,6 +14,11 @@
  * @module dsh-attention-group/router
  */
 
+// `singleLine` lives in sink.js because flattening "a value into one line of
+// text" is one job and deserves one implementation (digest.js uses it too).
+// `sink.js` imports only node builtins, so this adds no cycle.
+import { singleLine } from './sink.js'
+
 /** Wake reasons, strongest first. */
 export const REASON = {
   /** The message names this member. */
@@ -45,9 +50,18 @@ export const ROUTE_MODE = {
 /**
  * Extract `@name` tokens from message text.
  *
- * Names are matched longest-first so `@room-admin` does not also register as
- * `@room`. A name must be preceded by start-of-string or a non-word character,
- * which keeps `foo@bar` (an address) from being read as a mention.
+ * A name must sit on its own: the character before `@` must not be a letter,
+ * digit, underscore or `@`, and the character after the name must not be a
+ * letter, digit, underscore or `-`. That is what keeps `foo@bar` (an address)
+ * from reading as a mention, and `@room-admin` from also registering `room`.
+ *
+ * ⚠️ The boundaries are written with Unicode property escapes, NOT `\w`.
+ * `\w` is `[A-Za-z0-9_]`, so for a room holding both `小明` and `小明明` the
+ * pattern `@小明(?![\w-])` matched `@小明明` — the trailing `明` is not a `\w`
+ * character, so the lookahead was satisfied. Measured 2026-10-16 with two live
+ * sessions: **both were woken by a message that named only one of them**, which
+ * breaks this plugin's entire reason to exist. `\p{L}` counts CJK characters as
+ * letters, so the same message now reaches exactly the person named.
  *
  * @param {string} text - message text.
  * @param {string[]} names - candidate member names, any order.
@@ -60,7 +74,9 @@ export function extractMentions(text, names) {
   for (const name of ordered) {
     if (typeof name !== 'string' || name.length === 0) continue
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(`(^|[^\\w@])@${escaped}(?![\\w-])`, 'u')
+    // `\p{L}`/`\p{N}` need the `u` flag; `_` is listed separately because it is
+    // a word character that is neither a letter nor a number.
+    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_@])@${escaped}(?![\\p{L}\\p{N}_-])`, 'u')
     if (pattern.test(text) && !found.includes(name)) found.push(name)
   }
   return found
@@ -188,11 +204,18 @@ export function renderWakeMessage(input) {
     reason === REASON.mention
       ? '你是被 @ 点名的'
       : reason === REASON.keyword
-        ? `命中你的订阅词 ${JSON.stringify(input.detail ?? '')}`
+        ? `命中你的订阅词 ${JSON.stringify(singleLine(input.detail))}`
         : reason === REASON.broadcast
           ? '本群配置为全量唤醒'
           : '路由把它判给了你'
-  lines.push(`[群聊·${group.title ?? group.id}] "${message.fromName}" 发了一条消息（${why}）：`)
+  // ⚠️ This line is a MESSAGE SENT TO ANOTHER AGENT, which makes a forged line
+  // here worse than a forged line in a tool result: a room title or a member
+  // name containing a newline could append what reads as an instruction from the
+  // plugin. Fields are flattened; `message.text` below is NOT, because a
+  // multi-line message body is the message. Adversarial audit B-11's family.
+  lines.push(
+    `[群聊·${singleLine(group.title ?? group.id, 80)}] "${singleLine(message.fromName, 80)}" 发了一条消息（${why}）：`,
+  )
   if (typeof input.unread === 'number' && input.unread > 1) {
     lines.push(`（你上次查看后有 ${input.unread} 条新消息，这里是触发你的那条；完整历史用 attention_history 读。）`)
   }

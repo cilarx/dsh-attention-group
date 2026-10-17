@@ -1,0 +1,14 @@
+# Normalize line endings on commit and checkout.
+#
+# This repository is developed on Windows and published from it. Without this,
+# `git status` reports every file as modified after a clone because the working
+# tree uses CRLF while the index has LF — noise that hides real changes. Measured
+# on 2026-10-16: a fresh clone showed 0 modifications, but any editor that saved
+# a file reintroduced CRLF and turned one edited line into a whole-file diff.
+* text=auto eol=lf
+
+# Files that must keep their exact bytes.
+*.png binary
+*.jpg binary
+*.ico binary
+*.tgz binary

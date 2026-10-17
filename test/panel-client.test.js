@@ -556,7 +556,12 @@ test('the liaison block points a room at another and cannot point it at itself',
   assert.equal(posted.group, P_ID)
   assert.equal(posted.to, Q_ID)
   assert.equal(posted.mode, 'conclusion', 'the quiet mode is what the panel starts on')
-  assert.equal(posted.keywords, '发布, 上线')
+  // C-02 (2026-10-16): this line used to assert the STRING '发布, 上线' — it had
+  // pinned the wrong type as the contract. The host normalizes only arrays
+  // (`relay.js`: `Array.isArray(input.keywords) ? … : []`), so a string here
+  // means the keywords are dropped, the link can never relay, and the UI says it
+  // was created. The panel must send an array.
+  assert.deepEqual(posted.keywords, ['发布', '上线'], 'keywords must be sent as an array, never a string')
   assert.equal(posted.wake, false, 'a liaison must not start out waking anybody')
   await panel.settle()
 })

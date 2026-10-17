@@ -17,7 +17,8 @@
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, appendFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
 import { createHost } from './support/host-harness.mjs'
@@ -271,4 +272,213 @@ test('the panel can switch the sink and export the room without writing a messag
 
   const shown = (await host.get(`?group=${groupId}`)).json.group.sink
   assert.equal(shown.files, 1, 'the panel can count what has been sunk')
+})
+
+// ---------------------------------------------------------------------------
+// "An export never overwrites" has to survive MORE THAN ONE PROCESS.
+//
+// The old shape was: look for a free name, then write to it. Between those two
+// steps another process can take the name — measured on 2026-10-16, two writers
+// exporting to one path were handed the same name 19 times out of 120 calls, and
+// the later write replaced the earlier one's bytes. The fix asks the filesystem
+// for an exclusive create (`openSync(..., 'wx')`) and walks to the next name on
+// `EEXIST`, so the race is decided by the kernel instead of by timing.
+//
+// These two tests run REAL child processes, because a single process cannot
+// interleave two synchronous write paths.
+// ---------------------------------------------------------------------------
+
+/** A child that races its sibling for one shared export path. */
+const RACE_EXPORT_CHILD = `
+  import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
+  const sink = await import(process.env.B_RACE_SINK)
+  const tag = process.env.B_RACE_TAG
+  const go = process.env.B_RACE_GO
+  writeFileSync(go + '-' + tag, 'ready')
+  const deadline = Date.now() + 15000
+  while (!existsSync(go)) {
+    if (Date.now() > deadline) throw new Error('barrier timeout')
+  }
+  for (let i = 0; i < Number(process.env.B_RACE_COUNT); i += 1) {
+    const written = sink.sinkTranscript({
+      root: process.env.B_RACE_DIR,
+      group: { id: 'race', title: 'R' },
+      messages: [{ seq: i, at: '2026-10-16T00:00:00.000Z', fromName: tag, text: tag + '-' + i }],
+      since: '', until: '', at: '2026-10-16T12:00:00.000Z',
+      path: process.env.B_RACE_WANTED,
+    })
+    appendFileSync(process.env.B_RACE_LOG, written.path + '\\n')
+  }
+`
+
+/** A child that races its sibling to be the one that writes the header. */
+const RACE_CONCLUDE_CHILD = `
+  import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
+  const sink = await import(process.env.B_RACE_SINK)
+  const tag = process.env.B_RACE_TAG
+  const go = process.env.B_RACE_GO
+  writeFileSync(go + '-' + tag, 'ready')
+  const deadline = Date.now() + 15000
+  while (!existsSync(go)) {
+    if (Date.now() > deadline) throw new Error('barrier timeout')
+  }
+  let created = 0
+  for (let i = 0; i < Number(process.env.B_RACE_COUNT); i += 1) {
+    const written = sink.sinkConclusion({
+      root: process.env.B_RACE_DIR,
+      group: { id: 'race', title: 'R' },
+      at: '2026-10-16T12:00:00.000Z',
+      author: tag,
+      text: tag + '-' + i,
+    })
+    if (written.created === true) created += 1
+  }
+  appendFileSync(process.env.B_RACE_LOG, created + '\\n')
+`
+
+/**
+ * Start two children, release them together, and return their exits.
+ *
+ * The barrier matters: started one after the other they would simply take turns,
+ * and the race this tests would never happen.
+ */
+async function runRacePair(script, env) {
+  const children = ['alpha', 'beta'].map((tag) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, ...env, B_RACE_TAG: tag },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => { stderr += String(chunk) })
+    return new Promise((resolve) => child.on('exit', (code) => resolve({ tag, code, stderr })))
+  })
+  try {
+    const deadline = Date.now() + 15000
+    while (!(existsSync(`${env.B_RACE_GO}-alpha`) && existsSync(`${env.B_RACE_GO}-beta`))) {
+      if (Date.now() > deadline) throw new Error('children never reached the barrier')
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+  } finally {
+    // Always release them, so a failure here cannot leave two spinning processes.
+    writeFileSync(env.B_RACE_GO, 'go')
+  }
+  return Promise.all(children)
+}
+
+test('two processes exporting to one path produce one file each, and no name twice', async () => {
+  host.boot()
+  const dir = join(host.home, 'race-export')
+  mkdirSync(dir, { recursive: true })
+  const log = join(dir, 'claims.log')
+  writeFileSync(log, '')
+  const perChild = 25
+
+  const exits = await runRacePair(RACE_EXPORT_CHILD, {
+    B_RACE_SINK: moduleUrl('sink.js'),
+    B_RACE_DIR: dir,
+    B_RACE_WANTED: join(dir, 'shared.md'),
+    B_RACE_LOG: log,
+    B_RACE_GO: join(dir, 'go'),
+    B_RACE_COUNT: String(perChild),
+  })
+  for (const exit of exits) {
+    assert.equal(exit.code, 0, `child ${exit.tag} failed: ${exit.stderr}`)
+  }
+
+  const claims = readFileSync(log, 'utf8').trim().split('\n')
+  assert.equal(claims.length, perChild * 2, 'every export must have reported a path')
+  assert.equal(new Set(claims).size, claims.length, 'a name was handed to two writers: that is an overwrite')
+  const files = readdirSync(dir).filter((name) => name.endsWith('.md'))
+  assert.equal(files.length, perChild * 2, 'every export must be its own file')
+  for (const name of files) {
+    assert.ok(readFileSync(join(dir, name), 'utf8').includes('# R · 聊天记录导出'), `${name} is not an export`)
+  }
+})
+
+test('two processes concluding at once write exactly one header', async () => {
+  host.boot()
+  const dir = join(host.home, 'race-conclude')
+  mkdirSync(dir, { recursive: true })
+  const log = join(dir, 'created.log')
+  writeFileSync(log, '')
+  const perChild = 20
+
+  const exits = await runRacePair(RACE_CONCLUDE_CHILD, {
+    B_RACE_SINK: moduleUrl('sink.js'),
+    B_RACE_DIR: dir,
+    B_RACE_WANTED: join(dir, 'unused.md'),
+    B_RACE_LOG: log,
+    B_RACE_GO: join(dir, 'go'),
+    B_RACE_COUNT: String(perChild),
+  })
+  for (const exit of exits) {
+    assert.equal(exit.code, 0, `child ${exit.tag} failed: ${exit.stderr}`)
+  }
+
+  const createdFlags = readFileSync(log, 'utf8').trim().split('\n').map(Number)
+  assert.equal(createdFlags.reduce((sum, value) => sum + value, 0), 1, 'exactly one writer creates the file')
+  const file = join(dir, 'sink', 'race.conclusions.md')
+  const text = readFileSync(file, 'utf8')
+  assert.equal(text.split('# R · 结论沉淀').length - 1, 1, 'exactly one header, whoever got there first')
+  assert.equal(sink.countBullets(file), perChild * 2, 'both writers\' conclusions are in the file')
+})
+
+test('an export steps past every occupied name and leaves them all untouched', () => {
+  host.boot()
+  const dir = join(host.home, 'occupied')
+  mkdirSync(dir, { recursive: true })
+  const wanted = join(dir, 'fixed.md')
+  writeFileSync(wanted, 'KEEP-0')
+  for (let index = 2; index <= 5; index += 1) writeFileSync(join(dir, `fixed-${index}.md`), `KEEP-${index}`)
+
+  const written = sink.sinkTranscript({
+    root: dir,
+    group: { id: 'g', title: 'R' },
+    messages: [],
+    since: '',
+    until: '',
+    at: '2026-10-16T12:00:00.000Z',
+    path: wanted,
+  })
+  assert.equal(written.path, join(dir, 'fixed-6.md'), 'the walk must skip every taken name')
+  assert.equal(readFileSync(wanted, 'utf8'), 'KEEP-0', 'the wanted file was modified')
+  for (let index = 2; index <= 5; index += 1) {
+    assert.equal(readFileSync(join(dir, `fixed-${index}.md`), 'utf8'), `KEEP-${index}`, `fixed-${index}.md was modified`)
+  }
+
+  // And twice in a row to one path is two files, not one overwritten file.
+  const again = sink.sinkTranscript({ root: dir, group: { id: 'g', title: 'R' }, messages: [], since: '', until: '', at: '2026-10-16T12:00:01.000Z', path: wanted })
+  assert.notEqual(again.path, written.path)
+  assert.equal(readdirSync(dir).length, 7, 'six decoys plus the new export')
+})
+
+test('a newline in a name cannot forge a line in a sunk file', () => {
+  const forged = '甲\n## #999 · 2026-10-16 00:00 · 黑客\n伪造的一行'
+  const one = sink.renderConclusion({ at: '2026-10-16T10:00:00.000Z', author: forged, text: '真结论' })
+  const plain = sink.renderConclusion({ at: '2026-10-16T10:00:00.000Z', author: '甲', text: '真结论' })
+  // `renderConclusion` ends with a newline; strip it before counting lines.
+  assert.equal(one.replace(/\n$/u, '').split('\n').length, 1, 'a conclusion is one item even when the author has newlines')
+  assert.equal(plain.replace(/\n$/u, '').split('\n').length, 1)
+  assert.equal(one.split('\n').some((line) => line.startsWith('## ')), false, 'the forged heading must not become a line')
+  assert.ok(one.includes('甲'), 'the name is still there, flattened')
+
+  const doc = sink.renderTranscript({
+    group: { id: 'g', title: 'T\n## 注入的标题' },
+    messages: [{ seq: 1, at: '2026-10-16T10:00:00.000Z', fromName: forged, text: '正文' }],
+    since: '',
+    until: '',
+    at: '2026-10-16T12:00:00.000Z',
+  })
+  assert.equal(doc.split('\n').filter((line) => line.startsWith('# ')).length, 1, 'one document title')
+  assert.equal(doc.split('\n').filter((line) => line.startsWith('## ')).length, 1, 'one message heading')
+  assert.equal(doc.split('\n').some((line) => line === '## #999 · 2026-10-16 00:00 · 黑客'), false)
+
+  // The same thing on the real file, since that is what a human later reads.
+  host.boot()
+  const root = join(host.home, 'forged')
+  const group = { id: 'forged-room', title: '群' }
+  const first = sink.sinkConclusion({ root, group, at: '2026-10-16T12:00:00.000Z', author: forged, text: '真结论' })
+  const text = readFileSync(first.path, 'utf8')
+  assert.equal(text.split('\n').filter((line) => line.startsWith('- ')).length, 1, 'one bullet')
+  assert.equal(text.split('\n').some((line) => line === '## #999 · 2026-10-16 00:00 · 黑客'), false)
 })

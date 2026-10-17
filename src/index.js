@@ -18,7 +18,7 @@
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { readLedger, writeLedger, appendMessage, readMessages, resolveDataRoot, appendDelivery, readDeliveries } from './store.js'
+import { readLedger, writeLedger, appendMessage, readMessages, readMessagesWithStatus, resolveDataRoot, appendDelivery, readDeliveries, transcriptGroupIds } from './store.js'
 import { ROUTE_MODE, REASON, route, extractMentions } from './router.js'
 import { renderWakeMessage } from './router.js'
 import {
@@ -30,6 +30,7 @@ import {
   sizeOf,
   listSunk,
   inRange,
+  singleLine,
 } from './sink.js'
 import { buildDigest, resolveRange } from './digest.js'
 import { RELAY_MODES, RELAY_MODE, newLink, shouldRelay, relayRecord, linkSummary } from './relay.js'
@@ -80,13 +81,34 @@ const VERSION = '0.1.0'
  * @param {string[]} lines - display lines.
  * @returns {{type: 'text', text: string}[]} typed content blocks.
  */
+/**
+ * One rendered line, bounded, and honest about it.
+ *
+ * ⚠️ `MAX_RENDER_LINES` bounds how MANY lines a result carries and says nothing
+ * about how long one is. Adversarial audit A-6 (2026-10-16) measured a single
+ * 1 MiB message producing a **1,048,656-byte** tool result — two "lines" — and a
+ * 100,000-character room id producing a **100,120-byte** error line. A tool
+ * result is replayed into every later request of the session, so one enormous
+ * line costs exactly what many short ones cost, which is the compounding failure
+ * this project is built to avoid. The log keeps the full text; only the
+ * projection is cut, and the cut says so.
+ *
+ * @param {string} text - one rendered line.
+ * @returns {string} the line, no longer than `MAX_RENDER_LINE_CHARS`.
+ */
+function clampLine(text) {
+  if (text.length <= MAX_RENDER_LINE_CHARS) return text
+  const dropped = text.length - MAX_RENDER_LINE_CHARS
+  return `${text.slice(0, MAX_RENDER_LINE_CHARS)} … [line truncated here: ${dropped} more character(s) in the record; the durable log keeps everything]`
+}
+
 function textBlocks(lines) {
-  return lines.map((text) => ({ type: 'text', text: String(text) }))
+  return lines.map((text) => ({ type: 'text', text: clampLine(String(text)) }))
 }
 
 /** One typed content block from a single line. */
 function textBlock(text) {
-  return [{ type: 'text', text: String(text) }]
+  return [{ type: 'text', text: clampLine(String(text)) }]
 }
 
 /**
@@ -99,6 +121,16 @@ function textBlock(text) {
  */
 const MAX_RENDER_LINES = 200
 
+/**
+ * Hard cap on how many characters ONE rendered line may carry.
+ *
+ * The companion to `MAX_RENDER_LINES`, and it exists because a line count alone
+ * is not a size: one 1 MiB message is a two-line tool result. Applied in
+ * `clampLine`, i.e. at the single point every `render` in this file goes through,
+ * so a new render cannot forget it.
+ */
+const MAX_RENDER_LINE_CHARS = 2000
+
 /** Short, readable group id from a title. */
 function slugify(title) {
   const base = String(title)
@@ -109,6 +141,34 @@ function slugify(title) {
     .slice(0, 40)
   const stem = base.length > 0 ? base : 'group'
   return `${stem}-${Date.now().toString(36).slice(-4)}`
+}
+
+/**
+ * A group id that is not already taken.
+ *
+ * ⚠️ The suffix is the last four base-36 digits of the clock, which is
+ * `36^4 = 1,679,616 ms` — so two rooms created with the same title **28 minutes
+ * apart** derive the SAME id. Adversarial audit A-11 (2026-10-16) computed it,
+ * and showed the consequence: `requireGroup` returns the first match, so every
+ * later tool call for the second room silently lands in the first one. Two
+ * rooms merging into one is a much worse failure than an ugly id.
+ *
+ * @param {string} title - room title.
+ * @param {object[]} existing - current ledger rooms.
+ * @returns {string} a unique id.
+ */
+function uniqueGroupId(title, existing) {
+  const taken = new Set((Array.isArray(existing) ? existing : []).map((group) => group?.id))
+  const first = slugify(title)
+  if (!taken.has(first)) return first
+  // Same title, same 28-minute window: widen the suffix until it is free. The
+  // loop is bounded because each pass adds entropy, but a ledger with thousands
+  // of same-titled rooms is not a thing, so keep it short and deterministic.
+  for (let attempt = 2; attempt <= 99; attempt += 1) {
+    const candidate = `${first}-${attempt}`
+    if (!taken.has(candidate)) return candidate
+  }
+  return `${first}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 /** Find a group, or throw a message that names the real problem. */
@@ -128,7 +188,7 @@ function requireGroup(ledger, groupId) {
 /** A fresh group record: every knob has a default, every knob is settable later. */
 function newGroup(title, options = {}) {
   return {
-    id: slugify(title),
+    id: uniqueGroupId(title, options.existing),
     title,
     createdAt: new Date().toISOString(),
     charter: typeof options.charter === 'string' ? options.charter : '',
@@ -318,7 +378,74 @@ function mayInvite(group, actorId) {
 function countUnread(root, groupId, member, excludeSeq) {
   if (typeof member.lastReadAt !== 'string') return undefined
   const all = readMessages(root, groupId, { limit: 0 })
-  return all.filter((row) => row.at > member.lastReadAt && row.seq !== excludeSeq).length
+  return all.filter(
+    (row) =>
+      row.at > member.lastReadAt &&
+      // ⚠️ You have seen what you yourself wrote. Without this line, a member that
+      // posted a conclusion and had not yet re-read the room showed itself one
+      // unread message, forever, for its own words — adversarial audit B-08
+      // (2026-10-16). "Unread" has to mean "someone else said something I have
+      // not seen", or the badge is noise the human learns to ignore.
+      row.fromId !== member.id &&
+      row.seq !== excludeSeq,
+  ).length
+}
+
+/**
+ * The next sequence number for a room: one past the highest number ever used.
+ *
+ * ⚠️ NOT `messages.length + 1`. Sequence numbers are the room's ordering, and a
+ * hand-deleted or hand-edited line shortens the file without renumbering
+ * anything, so `length + 1` hands out a number that is already taken — measured
+ * `[1,3,3]` — and then anything keyed by `seq` (the unread exclusion above, a
+ * relay's `fromSeq` pointer) addresses two different messages at once.
+ * Adversarial audit B-08, 2026-10-16.
+ *
+ * @param {string} root - data root.
+ * @param {string} groupId - owning room.
+ * @returns {number} the next unused sequence number.
+ */
+function nextSeq(root, groupId) {
+  return nextSeqFrom(readMessages(root, groupId, { limit: 0 }))
+}
+
+/** `nextSeq` over rows the caller already read, so a relay does not read twice. */
+function nextSeqFrom(rows) {
+  let highest = 0
+  for (const row of rows) {
+    if (typeof row.seq === 'number' && Number.isFinite(row.seq) && row.seq > highest) highest = row.seq
+  }
+  return highest + 1
+}
+
+/**
+ * The origin keys (`fromGroup#fromSeq`) a room has already received by relay.
+ *
+ * Used for the diamond guard: in `A → B → D` plus `A → C → D`, the two copies of
+ * one message carry DIFFERENT trails, so the anti-loop trail cannot see that they
+ * are the same message and D receives it twice. What both copies share is their
+ * origin, which is exactly what this records. Adversarial audit B-07 (2026-10-16).
+ *
+ * @param {object[]} rows - a room's transcript.
+ * @returns {Set<string>} origin keys already present.
+ */
+function relayOriginsIn(rows) {
+  const keys = new Set()
+  for (const row of rows) {
+    const relay = row?.relay
+    if (relay === undefined || typeof relay.fromGroup !== 'string') continue
+    // The ROOT origin when the record carries one. `fromGroup`/`fromSeq` alone
+    // describe only the last hop, so two copies of one message arriving by
+    // different routes would look like two different messages.
+    const root = relay.origin
+    if (root !== undefined && typeof root.group === 'string' && typeof root.seq === 'number') {
+      keys.add(`${root.group}#${root.seq}`)
+      continue
+    }
+    if (typeof relay.fromSeq !== 'number') continue
+    keys.add(`${relay.fromGroup}#${relay.fromSeq}`)
+  }
+  return keys
 }
 
 /**
@@ -438,9 +565,13 @@ async function lastKnownRoute(ctx, sessionId) {
  * @returns {string} the user message body.
  */
 function renderSummaryRequest({ group, digest, requester }) {
+  // Like the wake message, this is sent TO a member, so a newline smuggled in
+  // through a room title or a member name would append what reads as an
+  // instruction from the plugin. Fields are flattened; `digest.text` is not,
+  // because it is the excerpt the member is being asked to read.
   return [
-    `【群聊总结请求】群「${group.title}」（${group.id}）`,
-    `${requester} 请你总结下面这段时间的交流。`,
+    `【群聊总结请求】群「${singleLine(group.title, 80)}」（${singleLine(group.id, 80)}）`,
+    `${singleLine(requester, 80)} 请你总结下面这段时间的交流。`,
     '',
     '----- 摘录开始 -----',
     digest.text,
@@ -700,23 +831,38 @@ function errorMessage(error) {
  * @param {number} [depth] - recursion depth; the trail is what really stops it.
  * @returns {Promise<object[]>} one row per link, relayed or refused.
  */
-async function relayMessage(ctx, state, fromGroup, record, depth = 0) {
+async function relayMessage(ctx, state, fromGroup, record, depth = 0, budget = { writes: MAX_RELAY_MESSAGES }) {
   const links = Array.isArray(fromGroup.links) ? fromGroup.links : []
   const report = []
 
   for (const link of links) {
+    if (budget.writes <= 0) {
+      // Shared across the whole recursive walk — see MAX_RELAY_MESSAGES.
+      report.push({
+        linkId: link.id,
+        to: link.to,
+        relayed: false,
+        reason: `relay budget exhausted (${MAX_RELAY_MESSAGES} messages written by a single call); send again or narrow the links`,
+      })
+      continue
+    }
     const target = state.ledger.groups.find((candidate) => candidate.id === link.to)
     if (target === undefined) {
       report.push({ linkId: link.id, to: link.to, relayed: false, reason: `the target room "${link.to}" no longer exists` })
       continue
     }
 
+    // One read of the target's transcript serves both the diamond guard and the
+    // next sequence number. Reading it twice would also open a window where the
+    // two answers disagree.
+    const targetRows = readMessages(state.root, target.id, { limit: 0 })
     const verdict = shouldRelay({
       link,
       from: fromGroup,
       record,
       targetId: target.id,
       targetMemberNames: target.members.map((member) => member.name),
+      targetRelayOrigins: relayOriginsIn(targetRows),
     })
     if (verdict.relay !== true) {
       report.push({ linkId: link.id, to: target.id, relayed: false, reason: verdict.reason })
@@ -733,11 +879,12 @@ async function relayMessage(ctx, state, fromGroup, record, depth = 0) {
       fromGroup,
       record,
       at,
-      seq: readMessages(state.root, target.id, { limit: 0 }).length + 1,
+      seq: nextSeqFrom(targetRows),
       mentions,
       reason: verdict.reason,
     })
     appendMessage(state.root, target.id, forwarded)
+    budget.writes -= 1
     link.lastFiredAt = at
     link.fireCount = (typeof link.fireCount === 'number' ? link.fireCount : 0) + 1
 
@@ -782,7 +929,7 @@ async function relayMessage(ctx, state, fromGroup, record, depth = 0) {
     // `maxHops`, so the recursion terminates on a finite set of rooms. `depth` is
     // a belt-and-braces bound for a pathological configuration.
     if (depth < MAX_RELAY_DEPTH) {
-      const onward = await relayMessage(ctx, state, target, forwarded, depth + 1)
+      const onward = await relayMessage(ctx, state, target, forwarded, depth + 1, budget)
       for (const row of onward) {
         report.push({ ...row, via: [target.id, ...(row.via ?? [])] })
       }
@@ -812,6 +959,25 @@ const RELAY_MODE_TARGET_ROUTE = ROUTE_MODE.rules
  * larger than any sane `maxHops`.
  */
 const MAX_RELAY_DEPTH = 8
+
+/**
+ * How many messages ONE call may write through liaisons, across every room.
+ *
+ * ⚠️ A fully-connected set of rooms multiplies. Adversarial audit A-8
+ * (2026-10-16) wired 7 rooms to each other (42 links) with `mode:"all"` and sent
+ * one message: it wrote **1,957** messages and took **17 seconds**, growing about
+ * 6x per room added (5 rooms → 65, 6 → 326, 7 → 1,957). Eight rooms is minutes;
+ * ten is hours.
+ *
+ * Capping `maxHops` does NOT fix this, which is worth stating because it looks
+ * like it should: with N rooms the anti-loop trail already bounds a chain to N
+ * hops, so the hop limit is not what is being spent — the fan-out is. The bound
+ * has to be on total work per call, and it has to be shared across the whole
+ * recursive walk rather than applied per room.
+ *
+ * Exhausting it is reported, never silent: a link that did not fire must say so.
+ */
+const MAX_RELAY_MESSAGES = 200
 
 /**
  * Take the session-controller service if this deployment has one.
@@ -1017,6 +1183,15 @@ function registerTools(ctx, state) {
             // means this deployment can change a live session's effort; anything
             // else is the reason it cannot.
             liveEffortControl: { type: 'string', required: true },
+            // Transcripts on disk that the ledger does not list. After a
+            // corrupt-ledger recovery the rooms look gone while every message is
+            // still there, so this is the line that answers "did I lose my
+            // history?" with a fact instead of a guess.
+            orphanedTranscripts: {
+              type: 'array',
+              required: true,
+              items: { type: 'string' },
+            },
           },
         },
         render: (_args, value) => {
@@ -1031,18 +1206,33 @@ function registerTools(ctx, state) {
               ? 'live effort control: available (a room may change a live session\'s effort with liveEffort)'
               : `live effort control: NOT available — ${value.liveEffortControl}`,
           )
+          // A deployment with three hundred live sessions must not turn this
+          // diagnostic into a three-hundred-line tool result that is then
+          // replayed into every later request of the session (c4). The COUNT is
+          // always the real one; only the listing is trimmed, and it says so.
+          const AGENT_ROWS = 20
           lines.push(`live agents (${value.liveAgents.length}):`)
-          for (const row of value.liveAgents) lines.push(`  ${row.self ? '* ' : '  '}${row.id}\t${row.status ?? '?'}`)
+          for (const row of value.liveAgents.slice(0, AGENT_ROWS)) {
+            lines.push(`  ${row.self ? '* ' : '  '}${singleLine(row.id, 120)}\t${singleLine(row.status ?? '?', 40)}`)
+          }
+          if (value.liveAgents.length > AGENT_ROWS) {
+            lines.push(`  … ${value.liveAgents.length - AGENT_ROWS} more live session(s) omitted from this view; the count above is the real one`)
+          }
           // The wake-up audit is the answer to "did it actually get delivered?".
           lines.push(`wake-up attempts logged: ${value.deliveryAudit.total}`)
           for (const row of value.deliveryAudit.recent) {
             lines.push(
-              `  ${row.at ?? '?'}\t${row.memberId ?? '?'}\t${row.delivered === true ? 'delivered' : 'NOT delivered'}\t${row.path ?? '?'}${row.note === undefined ? '' : `\t${row.note}`}`,
+              `  ${singleLine(row.at, 40) || '?'}\t${singleLine(row.memberId, 80) || '?'}\t${row.delivered === true ? 'delivered' : 'NOT delivered'}\t${singleLine(row.path, 40) || '?'}${row.note === undefined ? '' : `\t${singleLine(row.note, 200)}`}`,
             )
           }
           // Why the panel is or is not reachable. Without this line a missing
           // panel reads as "you have no groups yet".
           lines.push(`panel route: ${value.panelRoute.path} -> ${value.panelRoute.status}`)
+          if (value.orphanedTranscripts.length > 0) {
+            lines.push(
+              `transcripts on disk that the ledger does not list: ${value.orphanedTranscripts.length} — the messages still exist, only the room entry is missing (${value.orphanedTranscripts.slice(0, 5).join(', ')}${value.orphanedTranscripts.length > 5 ? ', …' : ''})`,
+            )
+          }
           return textBlocks(lines)
         },
       },
@@ -1072,18 +1262,34 @@ function registerTools(ctx, state) {
             const all = readDeliveries(state.root, { limit: 0 })
             return {
               total: all.length,
+              // ⚠️ Every field is defaulted, not passed through. A hand-edited or
+              // truncated `deliveries.jsonl` can hold a line like `{}`; forwarding
+              // its absent keys would put `undefined` in the result, and `undefined`
+              // is not lossless JSON — so the runtime would reject this diagnostic
+              // tool's entire answer with `ToolOutputError`. The one tool whose job
+              // is explaining what went wrong must not be the one that breaks.
               recent: all.slice(-5).map((row) => ({
-                at: row.at,
-                memberId: row.memberId,
+                at: typeof row.at === 'string' ? row.at : '',
+                memberId: typeof row.memberId === 'string' ? row.memberId : '',
                 delivered: row.delivered === true,
-                path: row.path,
-                ...(row.note === undefined ? {} : { note: row.note }),
-              })),            }
+                path: typeof row.path === 'string' ? row.path : '',
+                ...(typeof row.note === 'string' ? { note: row.note } : {}),
+              })),
+            }
           })(),
           panelRoute: {
             path: '/attention-group',
             status: typeof state.routeStatus === 'string' ? state.routeStatus : 'not attempted',
           },
+          // The one caller of `transcriptGroupIds`. A transcript whose room is not
+          // in the ledger is history the user still has: after a corrupt-ledger
+          // recovery the panel shows an empty room list, and without this line
+          // nothing anywhere says the messages survived. Reported as a fact, with
+          // the count, rather than inferred from the empty ledger.
+          orphanedTranscripts: (() => {
+            const known = new Set(state.ledger.groups.map((group) => group.id))
+            return transcriptGroupIds(state.root).filter((id) => !known.has(id))
+          })(),
         }
       },
     }),
@@ -1123,6 +1329,15 @@ function registerTools(ctx, state) {
             resumeAttempted: { type: 'boolean', required: true },
             resumed: { type: 'boolean' },
             note: { type: 'string' },
+            // ⚠️ Every other tool in this file declares `error`, and this one did
+            // not, while its own failure branch returns `{ok:false, error}`. The
+            // schema is enforced by the runtime AFTER execute (`createSuccessResult`
+            // → `validateJsonSchemaValue`), so a perfectly well-behaved refusal —
+            // an empty sessionId, reachable with no bad data at all — threw
+            // `ToolOutputError: "value.error" is not a declared property` instead of
+            // reaching the model as the sentence written below. A failure branch is
+            // still a return value; it has to satisfy the contract too.
+            error: { type: 'string' },
           },
         },
         render: (_args, value) => {
@@ -1164,8 +1379,32 @@ function registerTools(ctx, state) {
         if (live) return { ...base, resumeAttempted: true, resumed: false, note: 'already live; a resume would create a duplicate loop, so it was skipped' }
         if (route === undefined) return { ...base, resumeAttempted: true, resumed: false, note: 'no route available' }
         try {
-          const handle = await ctx.agents.resume({ resumeSessionId: sessionId, agentOptions: route })
-          return { ...base, route, resumeAttempted: true, resumed: true, note: `resumed ${String(handle.agent.id)}` }
+          // ⚠️ `setup` is NOT optional, and this branch used to omit it.
+          //
+          // `ctx.agents.resume` without `setup` gives the session the DEPLOYMENT
+          // DEFAULT preset instead of its own, which silently REPLACES its
+          // toolset. Measured 2026-10-16 (c6): a peer agent came back with
+          // `read`/`glob`/`grep`/`pwsh` all reporting as unknown tools, i.e. a
+          // diagnostic call stripped someone else's working environment. The
+          // delivery path was fixed then; this probe path was not, so the same
+          // accident was still reachable through the very tool built to check
+          // whether resuming works.
+          const launch = await composeLaunch(ctx, sessionId, undefined)
+          if (launch.agentOptions.provider === undefined || launch.agentOptions.model === undefined) {
+            return { ...base, route, resumeAttempted: true, resumed: false, note: 'no provider/model could be resolved for a resume' }
+          }
+          const handle = await ctx.agents.resume({
+            resumeSessionId: sessionId,
+            agentOptions: launch.agentOptions,
+            ...(launch.setup === undefined ? {} : { setup: launch.setup }),
+          })
+          return {
+            ...base,
+            route,
+            resumeAttempted: true,
+            resumed: true,
+            note: `resumed ${String(handle.agent.id)} with preset=${launch.preset ?? 'default'}${launch.setup === undefined ? ' (NO SETUP — this session may have the wrong toolset)' : ''}`,
+          }
         } catch (error) {
           return { ...base, route, resumeAttempted: true, resumed: false, note: `resume failed: ${errorMessage(error)}` }
         }
@@ -1205,7 +1444,7 @@ function registerTools(ctx, state) {
       execute(args, exec) {
         const title = typeof args.title === 'string' ? args.title.trim() : ''
         if (title.length === 0) return { ok: false, error: 'title is required' }
-        const group = newGroup(title, { charter: args.charter, wakeEnabled: args.wakeEnabled === true })
+        const group = newGroup(title, { charter: args.charter, wakeEnabled: args.wakeEnabled === true, existing: state.ledger.groups })
         // The creator always joins, regardless of policy: a room whose maker is
         // not in it is, under the default `members` policy, a room nobody can
         // ever add anyone to — dead on arrival.
@@ -1285,12 +1524,18 @@ function registerTools(ctx, state) {
           // A session that never read a room has every message unread. A session
           // that is not a member sees the room but is not counted: membership is
           // what makes a room's backlog yours.
+          //
+          // ⚠️ This used to hand-roll the same filter `countUnread` does, and the
+          // two drifted: this copy did not exclude the member's OWN messages, so
+          // an agent that had just posted showed itself an unread badge for its
+          // own words — the exact symptom of adversarial audit B-08 (2026-10-16).
+          // Two implementations of one rule is one implementation too many, so it
+          // now delegates. (Same lesson as c15: fixing `countUnread` alone would
+          // have fixed a path nobody reads.)
           const unread =
             member === undefined
               ? 0
-              : typeof member.lastReadAt === 'string'
-                ? all.filter((row) => row.at > member.lastReadAt).length
-                : all.length
+              : countUnread(state.root, group.id, member, undefined) ?? all.length
           unreadTotal += unread
           const last = all.length > 0 ? all[all.length - 1] : undefined
           return {
@@ -1523,7 +1768,7 @@ function registerTools(ctx, state) {
         const mentions = extractMentions(text, group.members.map((member) => member.name))
 
         const record = {
-          seq: readMessages(state.root, group.id, { limit: 0 }).length + 1,
+          seq: nextSeq(state.root, group.id),
           at: new Date().toISOString(),
           fromId: senderId,
           fromName: sender?.name ?? (senderId === undefined ? 'system' : String(senderId).slice(0, 12)),
@@ -1752,13 +1997,13 @@ function registerTools(ctx, state) {
         try {
           group = requireGroup(state.ledger, args.groupId)
         } catch (error) {
-          return { ok: false, error: errorMessage(error) }
+          return { ok: false, error: errorMessage(error), relayed: [] }
         }
         if (group.sinkEnabled === false) {
           return { ok: false, error: `conclusion sinking is off for group ${group.id}; turn on 「结论沉淀」 in the panel`, relayed: [] }
         }
         const text = typeof args.text === 'string' ? args.text.trim() : ''
-        if (text.length === 0) return { ok: false, error: 'text is required' }
+        if (text.length === 0) return { ok: false, error: 'text is required', relayed: [] }
 
         const author =
           typeof args.author === 'string' && args.author.trim().length > 0
@@ -1769,10 +2014,10 @@ function registerTools(ctx, state) {
         try {
           sunk = sinkConclusion({ root: state.root, group, at, author, text })
         } catch (error) {
-          return { ok: false, error: `cannot write the conclusion file: ${errorMessage(error)}` }
+          return { ok: false, error: `cannot write the conclusion file: ${errorMessage(error)}`, relayed: [] }
         }
         const record = {
-          seq: readMessages(state.root, group.id, { limit: 0 }).length + 1,
+          seq: nextSeq(state.root, group.id),
           at,
           fromId: exec.agent === undefined ? 'unknown' : String(exec.agent.id),
           fromName: author,
@@ -1965,7 +2210,11 @@ function registerTools(ctx, state) {
         },
         render: (_args, value) => {
           if (value.ok !== true) return textBlock(`failed: ${value.error ?? 'unknown error'}`)
-          if (value.total === 0) return textBlock(`nothing to summarise in ${value.groupId} for that range — nobody was woken`)
+          // Kept as a defensive path only: `execute` now refuses an empty window
+          // before anything is sent, so reaching this line with `total === 0`
+          // would mean a caller hand-built the value. It must not claim nobody
+          // was woken, because at this point in the old code that was a lie.
+          if (value.total === 0) return textBlock(`nothing to summarise in ${value.groupId} for that range`)
           return textBlocks([
             `${value.summarizerName} (${value.summarizerId}) was asked to summarise ${value.total} message(s) of ${value.groupId}`,
             value.delivered === true ? `delivered via ${value.path}` : `NOT delivered: ${value.note ?? 'dry run'}`,
@@ -2002,10 +2251,29 @@ function registerTools(ctx, state) {
         const limit = Math.min(requested, MAX_RENDER_LINES - 20)
         const digest = buildDigest({ group, messages: all, since, until, limit })
 
+        // ⚠️ An empty window is a REFUSAL, not a request to summarise nothing.
+        //
+        // This check used to live ONLY in `render`, i.e. after the request had
+        // already been appended to the room and the summariser already woken — so
+        // `range:"today"` on a quiet morning spent a real turn in someone else's
+        // session, and then the tool's own text claimed "nobody was woken". Two
+        // lies for the price of one: a burnt turn, and a diagnostic that denies
+        // having spent it. Adversarial audit A-9 / B-09, 2026-10-16.
+        if (digest.total === 0) {
+          return {
+            ok: false,
+            error: `nothing to summarise in 「${group.title}」 for that range, so no summariser was woken and no request was recorded`,
+            groupId: group.id,
+            since,
+            until,
+            total: 0,
+          }
+        }
+
         const requester = memberNameOf(group, exec.agent)
         const at = new Date().toISOString()
         const record = {
-          seq: readMessages(state.root, group.id, { limit: 0 }).length + 1,
+          seq: nextSeq(state.root, group.id),
           at,
           fromId: exec.agent === undefined ? 'unknown' : String(exec.agent.id),
           fromName: requester,
@@ -2386,44 +2654,110 @@ function registerPanelRoute(webServer, state) {
   }
 }
 
+/** A room's member list, guaranteed to be an array. */
+function safeMembers(group) {
+  return Array.isArray(group?.members) ? group.members : []
+}
+
 /**
- * The panel's whole read model, in one response.
+ * Why a room record is not shaped the way the panel expects, or `undefined`.
+ *
+ * Two sources, because a room can be malformed in two different moments:
+ *  - `state.ledgerRepairs` — what `store.js` had to fill in when it loaded the
+ *    ledger, which is the only place that sees the raw file;
+ *  - the shape check below — what is true of the ledger *right now*, since it is
+ *    mutated in memory long after that load.
+ *
+ * Either way the answer reaches the human. A malformed room may cost that room's
+ * detail; it must never cost the panel, and it must never be invisible.
  *
  * @param {object} state - plugin state.
- * @param {string|null} wanted - group to include a transcript for.
- * @returns {object} panel payload.
+ * @param {object} group - ledger record.
+ * @returns {string|undefined} a human-readable list of problems.
+ */
+function degradedReason(state, group) {
+  const problems = []
+  for (const repair of Array.isArray(state.ledgerRepairs) ? state.ledgerRepairs : []) {
+    if (repair.id === group?.id) problems.push(...repair.problems)
+  }
+  if (typeof group?.id !== 'string' || group.id.length === 0) problems.push('id is missing')
+  if (typeof group?.title !== 'string') problems.push('title is not a string')
+  if (!Array.isArray(group?.members)) problems.push('members is not an array')
+  return problems.length === 0 ? undefined : [...new Set(problems)].join('; ')
+}
+
+/** One room as the panel list sees it, with every field defensively defaulted. */
+function panelGroupRow(state, group) {
+  const id = typeof group?.id === 'string' && group.id.length > 0 ? group.id : ''
+  const status = id.length === 0 ? { records: [] } : readMessagesWithStatus(state.root, id, { limit: 0 })
+  const all = status.records
+  const newest = all.length === 0 ? undefined : all[all.length - 1]
+  const members = safeMembers(group)
+  const human = members.find((member) => member.id === HUMAN_ID)
+  const unread = id.length === 0 ? all.length : countUnread(state.root, id, human ?? {}, undefined)
+  const degraded = degradedReason(state, group)
+  return {
+    id,
+    title: typeof group?.title === 'string' ? group.title : '(untitled room)',
+    messages: all.length,
+    lastAt: newest === undefined ? '' : String(newest.at ?? ''),
+    lastFrom: newest === undefined ? '' : String(newest.fromName ?? ''),
+    lastPreview: newest === undefined ? '' : String(newest.text ?? '').replace(/\s+/gu, ' ').slice(0, 80),
+    wakeEnabled: group?.wakeEnabled === true,
+    routeMode: typeof group?.routeMode === 'string' ? group.routeMode : ROUTE_MODE.rules,
+    memberCount: members.length,
+    memberNames: members.map((member) => (typeof member?.name === 'string' ? member.name : '(unnamed)')),
+    // A room the human never joined cannot be "read", so everything in it is
+    // new — which is exactly right: they have in fact not seen any of it.
+    unread: unread === undefined ? all.length : unread,
+    // "The transcript is there but I could not open it" is not "no messages".
+    ...(status.unreadable === true ? { messagesUnreadable: true, messagesError: status.error ?? 'unknown error' } : {}),
+    ...(degraded === undefined ? {} : { degraded: true, degradedReason: degraded }),
+  }
+}
+
+/**
+ * The panel's whole room list, in one response.
+ *
+ * @param {object} state - plugin state.
+ * @returns {object[]} one row per room.
  */
 function panelGroups(state) {
   return state.ledger.groups.map((group) => {
-    const all = readMessages(state.root, group.id, { limit: 0 })
-    const newest = all.length === 0 ? undefined : all[all.length - 1]
-    const human = group.members.find((member) => member.id === HUMAN_ID)
-    const unread = countUnread(state.root, group.id, human ?? {}, undefined)
-    return {
-      id: group.id,
-      title: group.title,
-      messages: all.length,
-      lastAt: newest === undefined ? '' : String(newest.at ?? ''),
-      lastFrom: newest === undefined ? '' : String(newest.fromName ?? ''),
-      lastPreview: newest === undefined ? '' : String(newest.text ?? '').replace(/\s+/gu, ' ').slice(0, 80),
-      wakeEnabled: group.wakeEnabled === true,
-      routeMode: typeof group.routeMode === 'string' ? group.routeMode : ROUTE_MODE.rules,
-      memberCount: group.members.length,
-      memberNames: group.members.map((member) => member.name),
-      // A room the human never joined cannot be "read", so everything in it is
-      // new — which is exactly right: they have in fact not seen any of it.
-      unread: unread === undefined ? all.length : unread,
+    try {
+      return panelGroupRow(state, group)
+    } catch (error) {
+      // Last-resort guard. The field-level defaults above cover everything known;
+      // this makes "one bad room takes the panel down" impossible for the rest.
+      return {
+        id: typeof group?.id === 'string' ? group.id : '',
+        title: typeof group?.title === 'string' ? group.title : '(unreadable room)',
+        messages: 0,
+        lastAt: '',
+        lastFrom: '',
+        lastPreview: '',
+        wakeEnabled: false,
+        routeMode: ROUTE_MODE.rules,
+        memberCount: 0,
+        memberNames: [],
+        unread: 0,
+        degraded: true,
+        degradedReason: errorMessage(error),
+      }
     }
   })
 }
 
 /** One room's full detail, including every knob the settings view edits. */
 function panelGroupDetail(state, group) {
-  const all = readMessages(state.root, group.id, { limit: 0 })
+  const id = typeof group?.id === 'string' && group.id.length > 0 ? group.id : ''
+  const status = id.length === 0 ? { records: [] } : readMessagesWithStatus(state.root, id, { limit: 0 })
+  const all = status.records
+  const degraded = degradedReason(state, group)
   return {
-    id: group.id,
-    title: group.title,
-    createdAt: group.createdAt,
+    id,
+    title: typeof group?.title === 'string' ? group.title : '(untitled room)',
+    createdAt: group?.createdAt,
     charter: typeof group.charter === 'string' ? group.charter : '',
     wakeEnabled: group.wakeEnabled === true,
     routeMode: typeof group.routeMode === 'string' ? group.routeMode : ROUTE_MODE.rules,
@@ -2449,9 +2783,9 @@ function panelGroupDetail(state, group) {
       conclusionBytes: sizeOf(conclusionFile(state.root, group)),
       files: listSunk(state.root, group).length,
     },
-    members: group.members.map((member) => ({
-      id: member.id,
-      name: member.name,
+    members: safeMembers(group).map((member) => ({
+      id: member?.id,
+      name: typeof member?.name === 'string' ? member.name : '(unnamed)',
       kind: typeof member.kind === 'string' ? member.kind : 'session',
       enabled: member.enabled !== false,
       subscribe: Array.isArray(member.subscribe) ? member.subscribe : [],
@@ -2464,8 +2798,13 @@ function panelGroupDetail(state, group) {
     })),
     messageCount: all.length,
     // Newest-last, capped: the panel scrolls, and a room with years of history
-    // must not become one enormous response.
+    // must not become one enormous response. `truncated` has always been sent
+    // and was never read — 305 messages drew 300 rows and said nothing.
     truncated: all.length > 300,
+    // "I could not open the transcript" must reach the human as an error, not as
+    // an empty room. Same rule as `panelGroupRow`.
+    ...(status.unreadable === true ? { messagesUnreadable: true, messagesError: status.error ?? 'unknown error' } : {}),
+    ...(degraded === undefined ? {} : { degraded: true, degradedReason: degraded }),
     messages: all.slice(-300).map((row) => ({
       seq: row.seq,
       at: row.at,
@@ -2488,13 +2827,57 @@ function panelState(state, wanted) {
   const groups = panelGroups(state)
   // R10 needs a list of rooms to point a liaison at; the panel filters itself out.
   const linkTargets = groups.map((row) => ({ id: row.id, title: row.title }))
-  const base = { ok: true, version: VERSION, groups, knobs: PANEL_KNOBS, linkTargets }
+  const base = {
+    ok: true,
+    version: VERSION,
+    groups,
+    knobs: PANEL_KNOBS,
+    linkTargets,
+    // ⚠️ An unreadable ledger used to be indistinguishable from an empty one:
+    // `readLedger` collapsed both into "no rooms", this payload said `ok:true`,
+    // and the panel — correctly — drew "you have no rooms" while groups.json sat
+    // on disk completely intact. The status travels WITH the data now, because
+    // the panel has no second way to ask.
+    ...(state.ledgerUnreadable === true ? { ledgerUnreadable: true, ledgerError: state.ledgerError ?? 'unknown error' } : {}),
+    ...(state.ledgerRecoveredFrom === undefined ? {} : { ledgerRecoveredFrom: state.ledgerRecoveredFrom }),
+  }
   if (wanted === null || wanted === undefined) return base
 
   const group = state.ledger.groups.find((candidate) => candidate.id === wanted)
   if (group === undefined) return { ok: false, error: `unknown group "${wanted}"`, groups }
 
-  return { ...base, group: panelGroupDetail(state, group) }
+  try {
+    return { ...base, group: panelGroupDetail(state, group) }
+  } catch (error) {
+    // Building one room's detail must never cost the whole panel. Fall back to
+    // the list row plus the marker the panel already draws for a bad room, so
+    // the human sees one degraded room instead of an empty window.
+    const row = groups.find((candidate) => candidate.id === wanted) ?? { id: wanted, title: wanted }
+    return {
+      ...base,
+      group: {
+        ...row,
+        createdAt: undefined,
+        charter: '',
+        selfReflect: true,
+        joinPolicy: 'members',
+        defaultEffort: '',
+        liveEffort: false,
+        effortStatus: state.effortStatus ?? 'unknown',
+        sinkEnabled: true,
+        sinkDir: '',
+        sinkMemory: false,
+        links: [],
+        members: [],
+        sink: { dir: '', conclusionPath: '', conclusions: 0, conclusionBytes: 0, files: 0 },
+        messageCount: 0,
+        truncated: false,
+        messages: [],
+        degraded: true,
+        degradedReason: errorMessage(error),
+      },
+    }
+  }
 }
 
 /**
@@ -2520,7 +2903,7 @@ async function applyPanelAction(state, body) {
   if (action === 'create') {
     const title = typeof body?.title === 'string' ? body.title.trim() : ''
     if (title.length === 0) return { ok: false, error: 'title is required' }
-    const group = newGroup(title, { charter: body?.charter })
+    const group = newGroup(title, { charter: body?.charter, existing: state.ledger.groups })
     // Whoever made the room is in it. Members are told apart by id shape, so the
     // human uses a stable, non-session id rather than a session id it has none of.
     group.members.push(newMember({ id: HUMAN_ID, name: HUMAN_NAME, kind: 'user' }))
@@ -2538,24 +2921,31 @@ async function applyPanelAction(state, body) {
   if (action === 'join') {
     const memberId = String(body?.memberId ?? '').trim()
     if (memberId.length === 0) return { ok: false, error: 'memberId is required' }
-    const kind = PANEL_KNOBS.memberKinds.includes(body?.kind) ? body.kind : 'session'
+    // ⚠️ `undefined` when the caller did not name a kind, NOT 'session'.
+    // Defaulting here meant a caller that only wanted to re-join or rename
+    // someone silently DEMOTED an existing admin to a plain session — and the
+    // room then had no 群管理 at all, so `attention_summarize` had nobody to ask
+    // and reported "no admin member" for a room that visibly had one. A missing
+    // field must mean "leave it alone", never "set it to the default".
+    const kind = PANEL_KNOBS.memberKinds.includes(body?.kind) ? body.kind : undefined
     const existing = group.members.find((member) => member.id === memberId)
     if (existing === undefined) {
       group.members.push(
         newMember({
           id: memberId,
           name: body?.memberName,
-          kind,
+          kind: kind ?? 'session',
           subscribe: Array.isArray(body?.subscribe) ? body.subscribe : [],
         }),
       )
     } else {
       if (typeof body?.memberName === 'string' && body.memberName.trim().length > 0) existing.name = body.memberName.trim()
-      existing.kind = kind
+      if (kind !== undefined) existing.kind = kind
       existing.enabled = true
     }
     save()
-    return done({ memberId, members: group.members.length })
+    const changed = group.members.find((member) => member.id === memberId)
+    return done({ memberId, kind: changed?.kind ?? 'session', members: group.members.length })
   }
 
   if (action === 'charter') {
@@ -2594,8 +2984,20 @@ async function applyPanelAction(state, body) {
       // saying "yes, change the live sessions too" — otherwise the switch would be
       // a promise that only takes effect the NEXT time they touch something.
       if (group.liveEffort === true) applied = await applyEffortToLive(state.ctx, state, group, value, undefined)
-    } else if (liveEffortChange === true && typeof group.defaultEffort === 'string' && group.defaultEffort.length > 0) {
-      applied = await applyEffortToLive(state.ctx, state, group, group.defaultEffort, undefined)
+    } else if (liveEffortChange === true) {
+      if (typeof group.defaultEffort === 'string' && group.defaultEffort.length > 0) {
+        applied = await applyEffortToLive(state.ctx, state, group, group.defaultEffort, undefined)
+      } else {
+        // The switch was turned on while the room sits on "follow the session",
+        // so there is no effort to apply and zero sessions were touched. Saying
+        // nothing here is exactly how a switch ends up drawn as "on" while
+        // nothing happened at all — and the human reads that as success.
+        applied = {
+          ok: false,
+          results: [],
+          reason: 'the room effort is "follow the session", so switching this on changed nothing; choose an effort first',
+        }
+      }
     }
 
     save()
@@ -2608,6 +3010,10 @@ async function applyPanelAction(state, body) {
         : {
             liveApplied: applied.ok === true,
             applied: applied.results.filter((row) => row.applied === true).length,
+            // "2 members are live but only 1 could be changed" has to be visible:
+            // a partial success that says nothing is indistinguishable from a
+            // complete one, and the human has no way to find out which they got.
+            skipped: applied.results.filter((row) => row.applied !== true).length,
             ...(applied.reason === undefined ? {} : { liveReason: applied.reason }),
           }),
     })
@@ -2773,7 +3179,7 @@ async function applyPanelAction(state, body) {
   if (text.trim().length === 0) return { ok: false, error: 'text is required' }
   const at = new Date().toISOString()
   const record = {
-    seq: readMessages(state.root, group.id, { limit: 0 }).length + 1,
+    seq: nextSeq(state.root, group.id),
     at,
     fromId: HUMAN_ID,
     fromName: HUMAN_NAME,
@@ -2788,18 +3194,42 @@ async function applyPanelAction(state, body) {
     speaker.lastReadAt = at
     save()
   }
-  return { ok: true, seq: record.seq, mentions: record.mentions, woken: false }
+
+  // R10: a message spoken in the panel is still a message in this room, so it
+  // obeys the room's liaisons exactly like one sent through `attention_send` —
+  // the panel promises "everything said here is forwarded" and that has to be
+  // true. Forwarding wakes nobody by default (a link needs `wake` AND the target
+  // room's `wakeEnabled`), so this cannot turn a click into N turns.
+  const relayed = await relayMessage(state.ctx, state, group, record)
+
+  return { ok: true, seq: record.seq, mentions: record.mentions, woken: false, relayed }
 }
 
 /** Cordis plugin entry point. */
 function apply(ctx) {
   const root = resolveDataRoot()
-  const { ledger, recoveredFrom } = readLedger(root)
+  const { ledger, recoveredFrom, unreadable, error, repairs } = readLedger(root)
   // The context is kept on the state because some capability registration is
   // asynchronous: the panel route runs later, and it needs the same `ctx` the
   // tools already use to reach `sessionQuery` and `agents`.
-  const state = { root, ledger, ctx }
+  //
+  // The ledger's read status is kept too, and for the same reason: "there are no
+  // rooms" and "I could not open the room list" are different facts, and the
+  // panel route has no way to re-derive the second one later.
+  const state = { root, ledger, ctx, ledgerRepairs: Array.isArray(repairs) ? repairs : [] }
+  if (state.ledgerRepairs.length > 0) {
+    // Rooms that had to be repaired on load are still usable — `store.js` fills
+    // in the missing fields — but the human should hear about it rather than
+    // discover it later as a mystery.
+    console.warn(`${name}: ${state.ledgerRepairs.length} room(s) had malformed fields and were repaired on load: ${state.ledgerRepairs.map((row) => `${row.id || '(no id)'} (${row.problems.join(', ')})`).join('; ')}`)
+  }
+  if (unreadable === true) {
+    state.ledgerUnreadable = true
+    state.ledgerError = error ?? 'unknown error'
+    console.warn(`${name}: groups.json exists but could not be read (${state.ledgerError}); the panel will say so rather than report an empty room list`)
+  }
   if (recoveredFrom !== undefined) {
+    state.ledgerRecoveredFrom = recoveredFrom
     console.warn(`${name}: group ledger was unreadable and moved to ${recoveredFrom}; starting from an empty ledger`)
   }
   registerTools(ctx, state)

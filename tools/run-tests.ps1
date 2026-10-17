@@ -51,11 +51,13 @@ $files = @(
   'test/router.test.js'
   'test/tools.test.js'
   'test/panel-client.test.js'
+  'test/panel-fixes.test.js'
   'test/panel-host.test.js'
   'test/sink.test.js'
   'test/digest.test.js'
   'test/relay.test.js'
   'test/effort.test.js'
+  'test/robustness.test.js'
 ) | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path -LiteralPath $_ }
 
 $out = Join-Path $env:TEMP 'attention-group-tests.txt'

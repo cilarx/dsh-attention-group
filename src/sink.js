@@ -74,14 +74,82 @@ function appendText(file, text) {
 }
 
 /**
- * A path that does not exist yet.
+ * One data-derived value as ONE line of text.
  *
- * An export must never overwrite what is already there: the destination is a
- * file the human chose, and silently destroying it would be the worst possible
- * behaviour for a feature whose whole purpose is not losing things.
+ * Every renderer in this module writes lines whose SHAPE is the format
+ * (`- **time** · author · text`, `## #seq · time · name`). A value carrying a
+ * newline would not be a long line — it would be EXTRA LINES, and a reader
+ * cannot tell those from lines the plugin wrote itself. So anything meant to be
+ * a field is flattened here, once, for every renderer: `digest.js` imports this
+ * rather than growing a second copy that can drift.
+ *
+ * @param {unknown} value - any data-derived value.
+ * @param {number} [maxLength] - 0 means "no cap beyond being one line".
+ * @returns {string} a single, whitespace-collapsed line.
+ */
+export function singleLine(value, maxLength = 0) {
+  const text = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  return maxLength > 0 && text.length > maxLength ? text.slice(0, maxLength) : text
+}
+
+/**
+ * Names to try, best first, for a file that must be created fresh.
+ *
+ * This is a NAME GENERATOR, not a decision. "This name is free" cannot be
+ * decided by looking, because between the look and the write another process can
+ * take the name: measured on 2026-10-16, two processes exporting to one path
+ * were handed the same name **19 times out of 120 calls**, and the later write
+ * replaced the earlier one's bytes. So the write path creates EXCLUSIVELY and
+ * walks this list; the list never ends, because falling back to a plain
+ * overwriting write is the one outcome that must stay impossible.
+ *
+ * @param {string} wanted - the path the human asked for.
+ * @returns {Generator<string>} candidate paths, in preference order.
+ */
+function* candidatePaths(wanted) {
+  const stem = wanted.endsWith('.md') ? wanted.slice(0, -3) : wanted
+  yield wanted
+  for (let index = 2; index < 1000; index += 1) yield `${stem}-${index}.md`
+  // 999 numbered variants all taken is not "hopeless", it is a busy folder.
+  for (let round = 0; ; round += 1) yield `${stem}-${Date.now()}-${round}.md`
+}
+
+/**
+ * Create a file that did not exist, exclusively, at the first free name.
+ *
+ * `openSync(path, 'wx')` asks the filesystem to create-or-fail **in one atomic
+ * step**, so "an export never overwrites" stops depending on timing. `EEXIST`
+ * means that exact name was taken between our attempt and theirs — the race this
+ * loop exists to lose safely — so the next name is tried.
+ *
+ * @param {string} wanted - the path the human asked for.
+ * @returns {{fd: number, path: string}} an open descriptor for a brand-new file.
+ */
+function createExclusive(wanted) {
+  mkdirSync(dirname(wanted), { recursive: true })
+  for (const candidate of candidatePaths(wanted)) {
+    try {
+      return { fd: openSync(candidate, 'wx'), path: candidate }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+  }
+  // Unreachable: candidatePaths never ends, so the loop only exits by returning.
+  throw new Error(`no free name for ${wanted}: refusing to overwrite an existing file`)
+}
+
+/**
+ * A name that looks free right now — **ADVISORY ONLY**.
+ *
+ * Kept for callers that want to display or probe a name. The write path does NOT
+ * use this: a check is not a reservation, and the answer can be stale by the time
+ * anyone writes. Writing uses `createExclusive`, which cannot overwrite.
  *
  * @param {string} file - desired path.
- * @returns {string} the desired path, or the first free `-N` variant.
+ * @returns {string} the first candidate that does not exist at this instant.
  */
 export function freePath(file) {
   if (!existsSync(file)) return file
@@ -121,9 +189,9 @@ export function countBullets(file) {
  */
 export function conclusionHeader(group) {
   return [
-    `# ${group.title} · 结论沉淀`,
+    `# ${singleLine(group.title, 120)} · 结论沉淀`,
     '',
-    `> 群 id：\`${group.id}\``,
+    `> 群 id：\`${singleLine(group.id, 80)}\``,
     '> 由 dsh-attention-group 追加写入：每条结论一段，只增不改。',
     '> 这个文件不依赖任何插件，删掉插件它还在。',
     '',
@@ -134,6 +202,9 @@ export function conclusionHeader(group) {
  * One conclusion as a markdown list item.
  *
  * Continuation lines are indented so a multi-line conclusion stays one item.
+ * The conclusion TEXT is deliberately multi-line (that is the feature); the
+ * fields around it are single-line by construction, so a newline in an author
+ * name cannot forge a second conclusion.
  *
  * @param {object} input - `{at, author, text}`.
  * @returns {string} markdown.
@@ -141,7 +212,7 @@ export function conclusionHeader(group) {
 export function renderConclusion({ at, author, text }) {
   const lines = String(text ?? '').split('\n')
   const first = lines[0].trim()
-  const head = `- **${stamp(at)}** · ${author} · ${first}`
+  const head = `- **${singleLine(stamp(at))}** · ${singleLine(author, 80) || '?'} · ${first}`
   const rest = lines
     .slice(1)
     .map((line) => `  ${line}`)
@@ -159,27 +230,32 @@ export function inRange(row, since, until) {
 /**
  * A whole transcript as one markdown document.
  *
- * Deliberately NOT bounded: this is a file, not a tool result. The bound belongs
- * on the projection the model sees — which is why the tools return a path and a
- * count, never the transcript itself.
+ * Deliberately NOT bounded in LINES: this is a file, not a tool result. The bound
+ * belongs on the projection the model sees — which is why the tools return a path
+ * and a count, never the transcript itself. Message bodies and the charter stay
+ * multi-line on purpose; every FIELD around them (title, id, range, author) is
+ * flattened, so data cannot add headings of its own.
  *
  * @param {object} input - `{group, messages, since, until, at}`.
  * @returns {string} markdown.
  */
 export function renderTranscript({ group, messages, since, until, at }) {
+  const rangeStart = singleLine(since, 60) || '(开头)'
+  const rangeEnd = singleLine(until, 60) || '(最新)'
   const head = [
-    `# ${group.title} · 聊天记录导出`,
+    `# ${singleLine(group.title, 120)} · 聊天记录导出`,
     '',
-    `> 群 id：\`${group.id}\``,
-    `> 导出时间：${stamp(at)}`,
-    `> 时间范围：${typeof since === 'string' && since.length > 0 ? since : '(开头)'} → ${typeof until === 'string' && until.length > 0 ? until : '(最新)'}`,
+    `> 群 id：\`${singleLine(group.id, 80)}\``,
+    `> 导出时间：${singleLine(stamp(at))}`,
+    `> 时间范围：${rangeStart} → ${rangeEnd}`,
     `> 条数：${messages.length}`,
   ]
   const charter = typeof group.charter === 'string' ? group.charter.trim() : ''
   if (charter.length > 0) head.push('', '## 群规', '', charter)
   const body = []
   for (const row of messages) {
-    body.push('', `## #${row.seq} · ${stamp(row.at)} · ${row.fromName ?? '?'}`, '', String(row.text ?? ''))
+    const author = singleLine(row.fromName, 80) || '?'
+    body.push('', `## #${singleLine(row.seq)} · ${singleLine(stamp(row.at))} · ${author}`, '', String(row.text ?? ''))
   }
   return `${[...head, ...body].join('\n')}\n`
 }
@@ -188,19 +264,41 @@ export function renderTranscript({ group, messages, since, until, at }) {
  * Sink one conclusion: append its bullet, creating the file and its header
  * together the first time.
  *
+ * "First time" is decided by `openSync(..., 'wx')`, not by `existsSync`: two
+ * processes concluding at once used to both see "no file yet" and both write the
+ * header. Now exactly one of them creates it, and the other appends its bullet.
+ *
  * @param {object} input - `{root, group, at, author, text}`.
  * @returns {{path: string, bytes: number, created: boolean}} what happened.
  */
 export function sinkConclusion({ root, group, at, author, text }) {
   const file = conclusionFile(root, group)
-  const created = !existsSync(file)
-  const chunk = `${created ? conclusionHeader(group) : ''}${renderConclusion({ at, author, text })}`
-  appendText(file, chunk)
-  return { path: file, bytes: sizeOf(file), created }
+  const bullet = renderConclusion({ at, author, text })
+  mkdirSync(dirname(file), { recursive: true })
+  try {
+    const fd = openSync(file, 'wx')
+    try {
+      writeSync(fd, `${conclusionHeader(group)}${bullet}`)
+    } finally {
+      closeSync(fd)
+    }
+    return { path: file, bytes: sizeOf(file), created: true }
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+  }
+  // The file is already there: the header is already in it, so only the bullet
+  // is appended. (A delete landing in this window would leave a headerless file;
+  // that needs an outside writer removing the file mid-call — unverified here.)
+  appendText(file, bullet)
+  return { path: file, bytes: sizeOf(file), created: false }
 }
 
 /**
  * Write a transcript export. Never overwrites an existing file.
+ *
+ * The name is not chosen and then written: the file is created with `O_EXCL` at
+ * the first free candidate name, then filled. That is what makes the promise hold
+ * between two processes rather than only within one.
  *
  * @param {object} input - `{root, group, messages, since, until, at, path}`.
  * @returns {{path: string, bytes: number, messages: number}} what happened.
@@ -212,10 +310,8 @@ export function sinkTranscript({ root, group, messages, since, until, at, path }
         ? path.trim()
         : join(groupSinkDir(root, group), path.trim())
       : join(groupSinkDir(root, group), `${group.id}-${at.replace(/[:.]/gu, '-')}.md`)
-  const file = freePath(wanted)
   const text = renderTranscript({ group, messages, since, until, at })
-  mkdirSync(dirname(file), { recursive: true })
-  const fd = openSync(file, 'w')
+  const { fd, path: file } = createExclusive(wanted)
   try {
     writeSync(fd, text)
   } finally {
