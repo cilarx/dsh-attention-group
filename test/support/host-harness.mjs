@@ -209,13 +209,28 @@ export async function createHost(options = {}) {
           // The real service: "the zero-I/O listing read". A row's `title` here is
           // the projection value the sidebar shows — served straight from the
           // cache, never folded out of a log.
+          //
+          // ⚠️ Signature copied from the package's own declaration, NOT from the
+          // runtime Service inspect catalog (which abridges `cachedSnapshot` to
+          // `(meta, keys?)` and is therefore wrong):
+          //   cachedSnapshot(meta, inheritedEventCount, keys?)
+          // The real one throws for an unseeded session unless the cut is 0, so
+          // passing the keys array in that slot silently kills every title. This
+          // stub reproduces that throw so the discipline is testable here too.
+          const assertCut = (inheritedEventCount) => {
+            if (inheritedEventCount !== 0) {
+              throw new Error('unseeded projection-cache identity inherited event count must be 0')
+            }
+          }
           return {
-            cachedSnapshot(meta) {
+            cachedSnapshot(meta, inheritedEventCount) {
+              assertCut(inheritedEventCount)
               const row = sessionCatalog.find((candidate) => String(candidate.id) === String(meta?.id))
               if (row === undefined || typeof row.title !== 'string' || row.title.length === 0) return undefined
               return { asOfSeq: 1, values: { title: row.title } }
             },
-            cachedPredecessorTitle() {
+            cachedPredecessorTitle(meta, inheritedEventCount) {
+              assertCut(inheritedEventCount)
               return undefined
             },
           }

@@ -186,6 +186,27 @@ const MAX_TITLE_CHARS = 120
  * documented as "the zero-I/O listing read", checkpointed at session creation,
  * every `turn/end` and at disposal.
  *
+ * ⚠️⚠️ THE SECOND ARGUMENT IS THE INHERITED EVENT COUNT, NOT THE KEYS. The
+ * runtime's own Service inspect catalog shows
+ * `cachedSnapshot(meta, keys?)` / `cachedPredecessorTitle(meta)` — **that
+ * projection is abridged and wrong**. The authoritative declaration
+ * (`dsh-session-projection-cache/lib/types/index.d.ts`) and the implementation
+ * are:
+ *
+ *     cachedSnapshot(meta, inheritedEventCount, keys?)
+ *     cachedPredecessorTitle(meta, inheritedEventCount)
+ *
+ * Passing the keys array there does not fail politely: `identityOf()` receives
+ * an array as the offset, and for any unseeded session it **throws**
+ * `unseeded projection-cache identity inherited event count must be 0`. Every
+ * row then loses its title and the payload reports `partial: N of N titles could
+ * not be read` — a silently title-less picker on a perfectly healthy deployment.
+ * The shipped `dsh-api-session-controller` calls it as
+ * `cachedSnapshot(header, SessionLogOffset(0))`; a listing has no inherited cut,
+ * and for a seeded (forked) session the cut is what makes the own-checkpoint
+ * match fail, which is precisely when the predecessor title is the right answer.
+ * So the offset is always `0` here, exactly like the shipped caller.
+ *
  * ⚠️ The fallback ORDER is copied from the shipped API
  * (`dsh-api-session-controller`: `projectionsFor`) rather than invented here: a
  * seeded header has no own checkpoint, so its whole projection block is skipped
@@ -193,18 +214,29 @@ const MAX_TITLE_CHARS = 120
  * code that owns the format is how a display column starts showing another
  * session's title.
  *
+ * ⚠️ A FORKED session's title is genuinely out of reach from a listing, and that
+ * is the shipped behaviour too: its checkpoint is bound to an inherited cut that
+ * a `SessionHeader` does not carry, and the listing has no cut to offer, so
+ * `cachedSnapshot(header, 0)` cannot match it. Such a row shows as 「无标题会话」.
+ * On this machine (2026-10-17) that is 1 of 107 sessions — measured with
+ * `tools/check-picker-real-data.mjs`.
+ *
  * @param {object} cache - the `sessionProjectionCache` service.
  * @param {object} header - the session header (identity witness for the cache).
  * @returns {string|undefined} the title, or `undefined` when nothing usable exists.
  */
 function cachedTitle(cache, header) {
   if (header === undefined || header === null) return undefined
+  // A listing holds no inherited cut; 0 is what the shipped caller passes. The
+  // cache itself rejects a non-zero cut for an unseeded session, so this is also
+  // the only value that cannot be wrong for one.
+  const INHERITED_CUT = 0
   let block
   if (header.isSeeded !== true && typeof cache.cachedSnapshot === 'function') {
-    block = cache.cachedSnapshot(header, ['title'])
+    block = cache.cachedSnapshot(header, INHERITED_CUT, ['title'])
   }
   if (block === undefined && typeof cache.cachedPredecessorTitle === 'function') {
-    block = cache.cachedPredecessorTitle(header)
+    block = cache.cachedPredecessorTitle(header, INHERITED_CUT)
   }
   const value = block?.values?.title
   if (typeof value !== 'string') return undefined

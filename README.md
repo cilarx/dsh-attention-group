@@ -426,6 +426,12 @@ an existing member already answers to gets a suffix instead of a twin). Rows are
 (running) and 「已在群里」 (already in this room). Pasting an id still works: the picker is an
 extra path, never a replacement.
 
+The list shows **at most 40 rows** (`MAX_CANDIDATES` in `src/sessions.js`). That is a *readability*
+ceiling, not a cost one — the whole query is one session listing plus 40 zero-I/O cache reads — and
+a list that scrolls past forty rows is worse than typing an id. When it applies, the panel says
+「只显示最近 40 个（这个部署共有 N 个会话）」 instead of hiding the rest silently. The number is
+documented in the code comment and in both READMEs.
+
 > **Why the titles are not read out of the session logs.** Folding a title out of a session's
 > complete event log is what `sessionQuery.readTitleSnapshots` does, and measured on this machine
 > (2026-10-17) the 40 most recent logs total **67 MB** with a single log at 11 MB — one click
@@ -654,6 +660,25 @@ Flags: `--empty` starts from an empty ledger instead, `--keep` leaves the temp c
 inspection. It needs no running DSH — which also makes it the check to run after editing
 host-side code, since those changes cannot be exercised through the live runtime until DSH
 restarts.
+
+### Check the invite list against your real data
+
+```bash
+node tools/check-picker-real-data.mjs
+```
+
+It reads only your real files (`~/.dsh/sessions/`, `~/.dsh/storages/session_projcache/`,
+`~/.dsh/storages/workspace.json`), reproduces the two DSH services the way their shipped source
+behaves, runs the plugin's own `listSessionCandidates()` over them, and then checks every row:
+each title must match the projection cache **byte for byte**, no row may invent one, and every
+activity time must come from a real log. No DSH running, no restart.
+
+Why it exists as a separate tool: a unit test can only prove the code matches the contract the
+test believes. On 2026-10-17 that gap almost shipped a silently dead feature — the runtime's
+Service inspect catalog shows `cachedSnapshot` as `(meta, keys?)` while the real signature is
+`(meta, inheritedEventCount, keys?)`, which **throws** for an unseeded session when the keys land
+in the wrong slot: every title disappears and every test stays green. This script is how that
+class of mistake gets caught before a restart.
 
 The suites are layered on purpose:
 

@@ -103,20 +103,40 @@ function fakeCtx(catalog, extra = {}) {
       }
       if (name === 'sessionProjectionCache') {
         if (extra.noProjectionCache === true) return undefined
+        // ⚠️ These stubs mirror the AUTHORITATIVE signature, not the abridged one
+        // in the runtime's Service inspect catalog:
+        //   cachedSnapshot(meta, inheritedEventCount, keys?)
+        //   cachedPredecessorTitle(meta, inheritedEventCount)
+        // The real implementation THROWS when an unseeded session is asked with a
+        // non-zero cut, so the first version of the picker (which passed the keys
+        // array as the second argument) lost every title on a healthy deployment
+        // while every test here stayed green. The `assertCut` guard is what makes
+        // that mistake fail loudly instead of silently.
+        const assertCut = (meta, inheritedEventCount) => {
+          if (inheritedEventCount !== 0) {
+            throw new Error(
+              `unseeded projection-cache identity inherited event count must be 0 (got ${JSON.stringify(inheritedEventCount)})`,
+            )
+          }
+          assert.equal(typeof meta?.version, 'number', 'the cache identifies a lifecycle by the header version')
+        }
         return {
-          cachedSnapshot(meta) {
+          cachedSnapshot(meta, inheritedEventCount, keys) {
+            assertCut(meta, inheritedEventCount)
+            if (keys !== undefined) assert.deepEqual(keys, ['title'], 'the picker asks the cache for the title only')
             if (extra.titleError !== undefined) throw new Error(extra.titleError)
             const row = catalog.find((candidate) => candidate.id === meta?.id)
             if (row === undefined || typeof row.title !== 'string' || row.title.length === 0) return undefined
             if (extra.titleThrows === true) throw new Error('cache record is corrupt')
             return { asOfSeq: 1, values: { title: row.title } }
           },
-          cachedPredecessorTitle(meta) {
+          cachedPredecessorTitle(meta, inheritedEventCount) {
+            assertCut(meta, inheritedEventCount)
             // Mirrors the shipped API's fallback: only a SEEDED (forked) header has
             // no own checkpoint, so only it may borrow a predecessor's title.
             const row = catalog.find((candidate) => candidate.id === meta?.id)
             if (row === undefined || row.isSeeded !== true) return undefined
-            return { asOfSeq: 0, values: { title: `predecessor:${row?.title ?? ''}` } }
+            return { asOfSeq: -1, values: { title: `predecessor:${row?.title ?? ''}` } }
           },
         }
       }
