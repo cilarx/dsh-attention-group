@@ -241,9 +241,9 @@ room's 「唤醒」 switch — with waking off it refuses and says so (see
 
 Waking reaches a member that is **not** running. The other half of "offline members do not miss
 messages" is the member that **is** running for some unrelated reason: three messages may be
-waiting in a room it has no reason to look at. Turning on 「未读写进系统提示」 (`promptUnread`,
-**off by default**) publishes one line into that member's system prompt on every step — whether or
-not this room is why it is running:
+waiting in a room it has no reason to look at. Turning on 「未读写进系统提示」 ("unread in the
+system prompt") — `promptUnread`, **off by default** — publishes one line into that member's
+system prompt on every step, whether or not this room is why it is running:
 
 ```
 群聊未读：「插件工程协调」3 条。用 attention_history 读，attention_send 回复。
@@ -271,8 +271,9 @@ room.
 
 Two things, and only one of them can cost a turn:
 
-- **A reminder you may ignore.** 「群史摘要提醒」 (`summaryEvery`: 关 / 200 / 500 / 2000, default
-  **500**). Once a room has that many messages that no summary covers, the panel shows one line:
+- **A reminder you may ignore.** 「群史摘要提醒」 ("room-history summary reminder"; `summaryEvery`:
+  关 / 200 / 500 / 2000, default **500**). Once a room has that many messages that no summary
+  covers, the panel shows one line:
 
   ```
   提醒：这个群已有 612 条消息没摘要（阈值 500 条）。要不要摘要由你决定 —— 插件不会自己压缩，也不会删任何历史。
@@ -280,9 +281,9 @@ Two things, and only one of them can cost a turn:
 
   It wakes nobody, writes no file, changes no history and generates nothing. It is a nudge, not a
   policy.
-- **A summary you ask for.** The panel's 「生成群史摘要」 button. Generating a summary spends a
-  model turn in someone else's session, so it happens **only when a person clicks** — never on a
-  schedule, and never on its own.
+- **A summary you ask for.** The panel's 「生成群史摘要」 button ("generate a room-history
+  summary"). Generating one spends a model turn in someone else's session, so it happens **only
+  when a person clicks** — never on a schedule, and never on its own.
 
 What one click does:
 
@@ -355,8 +356,9 @@ their reason.
 means. Explicit `since`/`until` always overrule `range`.
 
 Every tool result is bounded: a tool result is replayed into every later request of the
-session that asked for it, so projections are capped at 200 lines and say so when they
-truncate. The durable logs themselves are never truncated — only what the model sees.
+session that asked for it, so projections are capped at **200 lines, 2000 characters per
+line, and 60000 characters in total** — and they say so when they truncate (the newest
+lines are kept). The durable logs themselves are never truncated — only what the model sees.
 
 ---
 
