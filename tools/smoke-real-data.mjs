@@ -154,7 +154,7 @@ const receipt = (value, label) => {
 // ---------------------------------------------------------------------------
 section('registry and diagnosis')
 // ---------------------------------------------------------------------------
-check(tools.size === 13, `13 tools registered (got ${tools.size})`)
+check(tools.size === 14, `14 tools registered (got ${tools.size})`)
 check(routes.length === 1 && routes[0].path === '/attention-group', 'the panel route registered itself')
 
 const probe = await call('attention_probe', {})
@@ -242,6 +242,13 @@ const asked = await call('attention_summarize', { groupId: room, range: 'today' 
 check(asked.ok === true && asked.summarizerName === '群管理', 'picked the room\'s own admin')
 check(asked.delivered === false, 'and woke nobody, because waking is two switches')
 check(typeof asked.request === 'string' && asked.request.includes('摘录开始'), 'and the digest travelled inside the request')
+
+// The write-back half of the manual summary button: the runtime cannot read the
+// answer a woken member writes, so the manager hands it back through this tool.
+const recorded = await call('attention_record_summary', { groupId: room, text: '冒烟：这段历史已被摘要。' })
+check(recorded.ok === true && recorded.summaries === 1, `attention_record_summary stored a snapshot (covers ${recorded.covered} message(s), up to #${recorded.upToSeq})`)
+const refusedSummary = await call('attention_record_summary', { groupId: room, text: '' })
+check(refusedSummary.ok === false && /text is required/.test(refusedSummary.error), 'and an empty summary is refused by naming the field')
 
 // ---------------------------------------------------------------------------
 section('U3 effort: recorded, never applied behind your back')

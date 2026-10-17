@@ -34,9 +34,9 @@ Three consequences that are design rules here, not accidents:
 
 - **Creating a room, adding members, reading history and posting never wake anybody.**
 - **Clicking anything in the panel wakes nobody** — with one deliberate exception,
-  「生成群史摘要」, which asks the room's manager to write a summary (see
-  [Room-history summaries](#room-history-summaries-r9)). A person typing in their own panel is
-  not an event; a person asking for a summary is.
+  「生成群史摘要」, which asks the room's manager to write a summary, and only while the room's
+  「唤醒」 switch is on (see [Room-history summaries](#room-history-summaries-r9)). A person typing
+  in their own panel is not an event; a person asking for a summary is.
 - **Nothing calls another plugin.** Rooms, transcripts, conclusions and exports are plain
   files, so this works on a bare DSH and survives this plugin being uninstalled.
 
@@ -233,7 +233,8 @@ Two operations are deliberately outside the wake system entirely: `attention_con
 speaking*.
 
 The panel's 「生成群史摘要」 button is also not a routed message: it is a **direct request** to one
-named member, and it is the one click in the panel that can start a turn (see
+named member. It is the one click in the panel that can start a turn, and it still needs the
+room's 「唤醒」 switch — with waking off it refuses and says so (see
 [Room-history summaries](#room-history-summaries-r9)).
 
 ### Unread in the system prompt (R6)
@@ -301,9 +302,14 @@ reads them.
 
 Because the flow is asynchronous, clicking does not produce a summary immediately. The panel
 reports what it actually did — 「已请求，等待群管理写回」 ("requested, waiting for the room manager
-to write back") — and the snapshot appears once the manager records it. If the room has no usable
-manager member, the request is **refused with the reason**, instead of waking nobody and looking
-like it worked.
+to write back") — and the snapshot appears once the manager records it. The request also tells the
+manager exactly how to hand the summary back (`groupId`, `text`, `upToSeq`), because a summary that
+is never recorded is a summary lost.
+
+Three things can stop a click, and each one is refused **by name** instead of silently doing
+nothing: the room has no usable manager (a `kind=admin` member that is itself a DSH session), the
+room's 「唤醒」 switch is off, or nothing has been posted since the last summary. A click can never
+turn a silent room noisy by accident.
 
 ### Liaisons (R10)
 
@@ -354,6 +360,20 @@ truncate. The durable logs themselves are never truncated — only what the mode
 
 ---
 
+### The keyboard entrance: `/group`
+
+You do not have to open the panel to talk to a room. Type `/group` in the composer:
+
+```
+/group list                rooms, with your unread count
+/group say <room> <text>   speak as yourself — nothing is woken
+/group today <room>        local tally of today's traffic (no model call)
+```
+
+A typed command **never starts a turn**: it writes the message and records its
+mentions, and waking still needs the room's own switch. Wrong room names come back
+as a list of the rooms that exist, not as a silent failure.
+
 ## Panel
 
 A global 「群聊」 entry in the sidebar (id `attention-group`, order 40) opens the panel. The
@@ -379,10 +399,10 @@ anyone.
 「移出」 with a confirm step, subscription terms, per-member effort), and 「这个群的记录在哪」.
 
 **The one click that can start a turn** is 「生成群史摘要」 (a direct request to the room's manager,
-never a scheduled job). It reports what it actually did — 「已请求，等待群管理写回」 ("requested,
-waiting for the room manager to write back") — because the summary is written later, in the
-manager's own turn, and comes home through `attention_record_summary`. The reminder setting
-generates nothing; it only counts.
+never a scheduled job, and only while the room's 「唤醒」 switch is on). It reports what it actually
+did — 「已请求，等待群管理写回」 ("requested, waiting for the room manager to write back") — because
+the summary is written later, in the manager's own turn, and comes home through
+`attention_record_summary`. The reminder setting generates nothing; it only counts.
 
 **Opening a room joins the human and marks it read.** The panel POSTs
 `{"action":"read"}` on open; the host adds the `user` member if needed and stamps
@@ -520,9 +540,9 @@ Written down because they are true, not because they are small:
   cost its own feature.
 - **A summary exists only once the manager writes it back.** Delivery into another session is
   one-way, so the plugin cannot collect the answer itself. If the manager never calls
-  `attention_record_summary` — or the request is refused because the room has no usable
-  manager — nothing is stored and the reminder keeps counting. That is the honest outcome, and
-  why the panel reports what it did instead of promising a summary.
+  `attention_record_summary` — or the click was refused, for any of the three reasons above —
+  nothing is stored and the reminder keeps counting. That is the honest outcome, and why the
+  panel reports what it did instead of promising a summary.
 - **DSB integration is deliberately shelved.** DSB is still changing in destructive ways, so
   no DSB support is implemented; the `liaison` member kind exists as the reserved place for
   it. Nothing else about DSB is claimed.
