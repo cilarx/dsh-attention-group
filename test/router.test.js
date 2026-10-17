@@ -116,6 +116,25 @@ test('the wake message names the room, the sender and the reason', () => {
   assert.match(text, /与我无关/)
 })
 
+test('a woken member is told HOW to answer: attention_send, because a normal reply stays private', () => {
+  // Measured 2026-10-18, in production: the wake message used to say
+  // "需要 → 正常回答。你的回复会进入群聊记录，其他成员也能看到。" That is false — an
+  // agent's normal turn output stays in its OWN session; the room only records
+  // what goes through `attention_send`. One panel broadcast woke all ten members,
+  // every one of them answered normally, and the room stayed silent while the
+  // human received ten private-looking answers. They followed the instructions;
+  // the instructions were wrong. This test pins the replacement.
+  const text = renderWakeMessage({
+    group: group(),
+    message: { fromName: 'Bob', text: '开会了', seq: 3, at: '2026-10-16T00:00:00.000Z' },
+    reason: REASON.broadcast,
+  })
+  assert.match(text, /attention_send/, 'the wake message must name the tool that actually reaches the room')
+  assert.match(text, /groupId: "g1"/, 'and the id, or the member spends another step finding it')
+  assert.doesNotMatch(text, /正常回答/)
+  assert.doesNotMatch(text, /你的回复会进入群聊记录/)
+})
+
 test('a newline in a field cannot forge a line in a wake message', () => {
   // The wake message is a MESSAGE SENT TO ANOTHER AGENT, which makes a forged
   // line here worse than one in a tool result: it reads as an instruction from

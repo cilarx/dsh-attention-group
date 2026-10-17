@@ -296,7 +296,23 @@ export function renderWakeMessage(input) {
   if (input.selfReflect !== false) {
     lines.push('请先判断这条消息是否需要你发言：')
     lines.push('- 不需要 → 只回一行「与我无关」并立刻结束，不要展开、不要调用工具。')
-    lines.push('- 需要 → 正常回答。你的回复会进入群聊记录，其他成员也能看到。')
+    // ⚠️ THIS LINE USED TO BE A LIE, and the lie cost a real test on 2026-10-18.
+    //
+    // It said: "需要 → 正常回答。你的回复会进入群聊记录，其他成员也能看到。"
+    // An agent's normal turn output stays in ITS OWN session — the room only
+    // records what is sent through `attention_send`. Measured that night: one
+    // panel broadcast woke all ten members (10/10 delivered), every one of them
+    // answered normally, and the room stayed completely silent while the human
+    // received ten private-looking answers. They did exactly what they were told;
+    // the instruction was wrong.
+    //
+    // A wake message that tells a member how to answer incorrectly is the same
+    // class of bug as a panel that renders a failed read as an empty room (c7):
+    // it burns a turn AND makes a working product look broken. The group id is
+    // included so the member does not have to spend another step finding it.
+    lines.push(
+      `- 需要 → 用 attention_send 把回复发进这个群（groupId: "${singleLine(group.id ?? '', 120)}"）。直接输出文字只会留在你自己的会话里，群里看不到。`,
+    )
   }
   return lines.join('\n')
 }
