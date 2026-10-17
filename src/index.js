@@ -2025,8 +2025,13 @@ function registerTools(ctx, state) {
         // stays plain text, and the answer SAYS which gate refused it (c7: no
         // silent downgrade of a feature the sender believed in).
         const askedAll = hasMentionAll(text)
-        const senderKind = typeof sender?.kind === 'string' ? sender.kind : sender === undefined ? 'user' : 'session'
-        const senderMayAddressAll = sender === undefined || senderKind === 'user' || senderKind === 'admin'
+        // ⚠️ STRICT on purpose: an UNKNOWN sender is not allowed. A megaphone that
+        // anyone can pick up by calling the tool without being a member is worse
+        // than no megaphone at all. The sender must be a real room member whose
+        // kind is `user` (the human) or `admin` — a session member's `@所有人` stays
+        // plain text even after the room opts in.
+        const senderKind = typeof sender?.kind === 'string' ? sender.kind : ''
+        const senderMayAddressAll = sender !== undefined && (senderKind === 'user' || senderKind === 'admin')
         const allMention = askedAll && group.mentionAll === true && senderMayAddressAll
         const allMentionNote = !askedAll
           ? undefined
@@ -2034,7 +2039,7 @@ function registerTools(ctx, state) {
             ? undefined
             : group.mentionAll !== true
               ? 'text says @所有人, but 「允许 @所有人」 is off for this room — only the @-named members were addressed'
-              : '@所有人 was ignored: only the human and room admins may address everyone'
+              : '@所有人 was ignored: only a room member who is the human or an admin may address everyone'
 
         const record = {
           seq: nextSeq(state.root, group.id),

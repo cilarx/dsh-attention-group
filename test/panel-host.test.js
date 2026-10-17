@@ -169,11 +169,16 @@ test('@所有人 is inert until the room allows it, and then it addresses the wh
   await post({ action: 'join', group: groupId, memberId: second, memberName: '乙' })
 
   const send = host.tool('attention_send')
-  const exec = { agent: { id: 'session-sender-0000-0000-0000-000000000003' } }
+  const admin = 'session-adm1n-0000-0000-0000-000000000009'
+  await post({ action: 'join', group: groupId, memberId: admin, memberName: '管理', kind: 'admin' })
+  const execAdmin = { agent: { id: admin } }
+  const execPlain = { agent: { id: first } }
+  // A caller that is not a member at all must never get the megaphone.
+  const execOutsider = { agent: { id: 'session-outside-0000-0000-0000-00000000ffff' } }
 
   // Default OFF. The message is still posted; the phrase just stays plain text,
   // and the answer names the gate that refused it (no silent downgrade).
-  const off = await send.execute({ groupId, text: '@所有人 开会' }, exec)
+  const off = await send.execute({ groupId, text: '@所有人 开会' }, execAdmin)
   assert.equal(off.ok, true)
   assert.equal(off.allMention, false)
   assert.match(off.allMentionNote, /允许 @所有人/)
@@ -181,7 +186,19 @@ test('@所有人 is inert until the room allows it, and then it addresses the wh
   assert.equal(host.delivered.length, 0)
 
   await post({ action: 'mentionAll', group: groupId, mentionAll: true })
-  const on = await send.execute({ groupId, text: '@所有人 开会' }, exec)
+
+  // Switch on, but a plain SESSION member still cannot address everyone...
+  const plainTry = await send.execute({ groupId, text: '@所有人 开会' }, execPlain)
+  assert.equal(plainTry.allMention, false)
+  assert.match(plainTry.allMentionNote, /human or an admin/)
+
+  // ...and neither can a caller that is not a member of this room.
+  const outsiderTry = await send.execute({ groupId, text: '@所有人 开会' }, execOutsider)
+  assert.equal(outsiderTry.allMention, false)
+  assert.match(outsiderTry.allMentionNote, /human or an admin/)
+
+  // Only the human and room admins get through.
+  const on = await send.execute({ groupId, text: '@所有人 开会' }, execAdmin)
   assert.equal(on.ok, true)
   assert.equal(on.allMention, true)
   assert.equal(on.allMentionNote, undefined, 'a granted broadcast needs no excuse')
