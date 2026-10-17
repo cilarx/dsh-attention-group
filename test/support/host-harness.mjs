@@ -72,6 +72,10 @@ export async function createHost(options = {}) {
   // Every runtime prompt context the plugin published. A test drives it exactly
   // the way the harness does: `definition.text({ agent: { session: { id } } })`.
   let promptContexts = []
+  // Human-command definitions the plugin registered. The runtime's `commands`
+  // registry calls `handler({rawInput, agent, …})` directly when the human types
+  // `/group …`, so a test drives the same entry point.
+  let commandDefs = new Map()
 
   // The deployment's real `webServer` face, hoisted out of `reboot()` so that
   // `reactivate()` can hand the SAME service object back to the child fiber.
@@ -107,6 +111,7 @@ export async function createHost(options = {}) {
     registrations = []
     injects = []
     promptContexts = []
+    commandDefs = new Map()
     tools = new Map()
     for (const name of extraTools) {
       tools.set(name, {
@@ -178,6 +183,19 @@ export async function createHost(options = {}) {
                   const index = promptContexts.indexOf(definition)
                   if (index >= 0) promptContexts.splice(index, 1)
                 }
+              },
+            },
+            effect(callback) {
+              return callback()
+            },
+          })
+        }
+        if (names.includes('commands')) {
+          cb({
+            commands: {
+              register(definition) {
+                commandDefs.set(definition.name, definition)
+                return () => commandDefs.delete(definition.name)
               },
             },
             effect(callback) {
@@ -291,6 +309,10 @@ export async function createHost(options = {}) {
     /** Runtime prompt contexts the plugin published, in registration order. */
     get promptContexts() {
       return promptContexts
+    },
+    /** Human commands the plugin registered, keyed by name. */
+    get commands() {
+      return commandDefs
     },
     tool(name) {
       return tools.get(name)

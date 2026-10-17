@@ -33,8 +33,10 @@ Waking is a second, explicit step, and it needs **two** switches to agree (see
 Three consequences that are design rules here, not accidents:
 
 - **Creating a room, adding members, reading history and posting never wake anybody.**
-- **Clicking anything in the panel never wakes anybody.** A person typing in their own
-  panel is not an event.
+- **Clicking anything in the panel wakes nobody** — with one deliberate exception,
+  「生成群史摘要」, which asks the room's manager to write a summary (see
+  [Room-history summaries](#room-history-summaries-r9)). A person typing in their own panel is
+  not an event; a person asking for a summary is.
 - **Nothing calls another plugin.** Rooms, transcripts, conclusions and exports are plain
   files, so this works on a bare DSH and survives this plugin being uninstalled.
 
@@ -153,9 +155,10 @@ pwsh -File tools/sync-plugin.ps1
 
 Call the `attention_probe` tool. It reports the data root, how many rooms exist, which live
 agents are visible, which optional services this deployment offers, the last five wake-up
-attempts with the path each one took, and the status of the panel route (`registered`, or the
-exact reason it is not). A missing panel that reads as "you have no rooms" is the failure
-this line exists to prevent.
+attempts with the path each one took, the status of the panel route (`registered`, or the
+exact reason it is not), and whether the unread prompt line registered (`promptContext` — a
+deployment with no prompt service loses that nudge, and this says so). A missing panel that
+reads as "you have no rooms" is the failure this line exists to prevent.
 
 ---
 
@@ -229,6 +232,79 @@ Two operations are deliberately outside the wake system entirely: `attention_con
 `attention_export` write files and record a message, and wake nobody — *sinking is not
 speaking*.
 
+The panel's 「生成群史摘要」 button is also not a routed message: it is a **direct request** to one
+named member, and it is the one click in the panel that can start a turn (see
+[Room-history summaries](#room-history-summaries-r9)).
+
+### Unread in the system prompt (R6)
+
+Waking reaches a member that is **not** running. The other half of "offline members do not miss
+messages" is the member that **is** running for some unrelated reason: three messages may be
+waiting in a room it has no reason to look at. Turning on 「未读写进系统提示」 (`promptUnread`,
+**off by default**) publishes one line into that member's system prompt on every step — whether or
+not this room is why it is running:
+
+```
+群聊未读：「插件工程协调」3 条。用 attention_history 读，attention_send 回复。
+```
+
+What keeps it cheap and honest:
+
+- **Counts only, never text.** The message body stays in the room; the member decides whether the
+  count is worth a call to `attention_history`.
+- **At most three rooms**, so the line cannot grow with the number of rooms.
+- A room the member has **never read** says 有未读 rather than inventing a number.
+- **Silence when there is nothing to say.** No unread, no line — this plugin's whole claim is that
+  it shuts up.
+- It is published through the runtime-context channel (`systemPrompt.context()`), which the
+  harness **re-projects after compaction**, so the nudge does not vanish when the conversation is
+  summarised.
+- The count is cached in memory for **5 seconds**, and the cache key carries the member's
+  `lastReadAt`, so a step costs one map lookup — not a scan of a long room's JSONL. Reading the
+  room invalidates the cache immediately.
+
+It is a per-room switch because it is a per-step cost, paid in every step of every member of that
+room.
+
+### Room-history summaries (R9+)
+
+Two things, and only one of them can cost a turn:
+
+- **A reminder you may ignore.** 「群史摘要提醒」 (`summaryEvery`: 关 / 200 / 500 / 2000, default
+  **500**). Once a room has that many messages that no summary covers, the panel shows one line:
+
+  ```
+  提醒：这个群已有 612 条消息没摘要（阈值 500 条）。要不要摘要由你决定 —— 插件不会自己压缩，也不会删任何历史。
+  ```
+
+  It wakes nobody, writes no file, changes no history and generates nothing. It is a nudge, not a
+  policy.
+- **A summary you ask for.** The panel's 「生成群史摘要」 button. Generating a summary spends a
+  model turn in someone else's session, so it happens **only when a person clicks** — never on a
+  schedule, and never on its own.
+
+What one click does:
+
+1. The plugin packs the messages posted **since the last stored summary** into the request.
+2. It wakes the room's manager — the member whose `kind` is `admin` — through **that member's own**
+   provider and model, spending whoever installed this plugin's quota.
+3. The manager writes the prose in its turn and calls `attention_record_summary`.
+4. The room record gains a snapshot: the message number it covers (`upToSeq`), the time, who wrote
+   it, and the text.
+
+Delivery into another session is **one-way** — the plugin hands over a message and never sees the
+answer — which is exactly why step 3 is a tool the member has to call itself.
+
+**No message is deleted.** The transcript is the record; a summary is a *projection* of it that is
+easier to read. A summarised room still has every original line, and `attention_history` still
+reads them.
+
+Because the flow is asynchronous, clicking does not produce a summary immediately. The panel
+reports what it actually did — 「已请求，等待群管理写回」 ("requested, waiting for the room manager
+to write back") — and the snapshot appears once the manager records it. If the room has no usable
+manager member, the request is **refused with the reason**, instead of waking nobody and looking
+like it worked.
+
 ### Liaisons (R10)
 
 A liaison is a **directed** link living on the sending room: "when something happens in this
@@ -250,7 +326,7 @@ their reason.
 
 ## Tools
 
-**12 tools** are registered by the host half.
+**14 tools** are registered by the host half.
 
 | Tool | What it does | Key parameters |
 |---|---|---|
@@ -265,6 +341,7 @@ their reason.
 | `attention_export` | Write a time range of a room's transcript to a Markdown file and report the real path. Never overwrites an existing file, never wakes anybody. | `groupId` (required), `since`, `until` (ISO-8601), `limit`, `path` |
 | `attention_digest` | Summarise a range with **no model and no wake-up**: counts, who spoke how often, which conclusions were sunk, and the messages. The free half of summarising. | `groupId` (required), `range` (`today` / `24h` / `all`, default `all`), `since`, `until`, `limit` (default 50, capped at 180) |
 | `attention_summarize` | Ask a member — by default the room's first enabled `kind=admin` — to write a summary. The ready-made digest travels **inside** the request, so the woken member answers in one turn. | `groupId` (required), `range` / `since` / `until`, `limit` (default 80), `memberId`, `wake` (default false) |
+| `attention_record_summary` | Store a room-history summary snapshot in the room record: the message number it covers, when, who wrote it, and the text. The write-back half of 「生成群史摘要」 — delivery is one-way, so the manager has to hand its summary back itself. Deletes nothing and wakes nobody. | `groupId` (required), `text` (required — the summary itself), `upToSeq` (optional — the last message it covers; omitted means the newest) |
 | `attention_link` | Manage the room's liaisons. Call with `to` omitted to list them. Directed, loop-proof, and records-only by default. | `groupId` (required), `to`, `mode` (`conclusion` default / `keyword` / `mention` / `all`), `keywords`, `wake`, `enabled`, `maxHops` (default 3), `remove` |
 | `attention_effort` | Set the room's one effort knob, or one member's override — and, with `live: true`, change the LIVE sessions now. | `groupId` (required), `effort` (required: `off` / `low` / `high` / `max` / `""`), `memberId`, `live` (default false) |
 
@@ -295,10 +372,17 @@ mentions work, Enter sends, Shift+Enter makes a newline. The panel's own post ne
 anyone.
 
 **Settings tab:** 「群名称」, 「唤醒」, 「推理强度（群统一）」 (a slider), 「路由模式」, 「自省」,
-「群规」, 「拉人权限」, 「结论沉淀」 (switch, real conclusion-file path, counts, sink folder,
+「未读写进系统提示」, 「群史摘要提醒」 (关 / 200 条 / 500 条 / 2000 条), 「群规」,
+「拉人权限」, 「结论沉淀」 (switch, real conclusion-file path, counts, sink folder,
 「导出这个群的记录」, 「同时写任务记忆」), 「沟通员（对外转发）」 (per-link mode, 「停用」/「启用」,
 「改为只记录」/「改为叫醒」, 「移除」, and a target picker), 「成员」 (per-member 「休眠」/「启用」,
 「移出」 with a confirm step, subscription terms, per-member effort), and 「这个群的记录在哪」.
+
+**The one click that can start a turn** is 「生成群史摘要」 (a direct request to the room's manager,
+never a scheduled job). It reports what it actually did — 「已请求，等待群管理写回」 ("requested,
+waiting for the room manager to write back") — because the summary is written later, in the
+manager's own turn, and comes home through `attention_record_summary`. The reminder setting
+generates nothing; it only counts.
 
 **Opening a room joins the human and marks it read.** The panel POSTs
 `{"action":"read"}` on open; the host adds the `user` member if needed and stamps
@@ -318,6 +402,8 @@ Every knob is per room, stored in `groups.json`, and settable from the panel or 
 | `routeMode` | `rules` | `rules` / `classify` / `broadcast` | How much work goes into deciding who is relevant. |
 | `wakeEnabled` | `false` | `true` / `false` | The room's wake-up master switch. Off means routing is still computed and reported, but no turn is ever started. |
 | `selfReflect` | `true` | `true` / `false` | Tells a woken member to decide cheaply whether it needs to speak, and to answer with one line if not. |
+| `promptUnread` | `false` | `true` / `false` | Publish a one-line unread notice into every member's system prompt (counts only, at most three rooms, cached for 5 s so a step costs one lookup). Off by default because it is a per-step cost. |
+| `summaryEvery` | `500` | `0` (off) / `200` / `500` / `2000` | How many messages without a summary it takes before the panel starts reminding you. A reminder only: it wakes nobody, writes nothing, and generates nothing. |
 | `joinPolicy` | `members` | `open` / `members` / `user` / `nobody` | Who may add members. The human id always passes — a person who locks themselves out of their own room has been failed by design. |
 | `defaultEffort` | `''` | `''` / `off` / `low` / `high` / `max` | The room's **one** reasoning-effort knob (R4b). `''` means the room has no opinion and the woken session's own route wins. |
 | `liveEffort` | `false` | `true` / `false` | Whether this room may also change the effort of sessions that are **alive right now**. Off by default: the call behind it also saves the selection as the deployment default model. Needs a deployment with `sessionController`; `attention_probe` reports `liveEffortControl`. |
@@ -361,6 +447,9 @@ Details that matter:
   log stays empty is the hardest failure to diagnose, so every attempt is recorded with its
   path (`live-followup`, `cold-resume`, `skipped`, `non-session`, `dry-run`) and note.
 - A torn final JSONL line is skipped instead of making the whole history unreadable.
+- A summary snapshot lives on the room record (`summaries`: `upToSeq`, `at`, `by`, `text`) and is
+  written with the same atomic ledger replace as every other room field. Losing one costs a
+  re-summary; it never puts a message at risk.
 
 ### "Group records never enter anyone's session"
 
@@ -368,8 +457,25 @@ Strictly: **a room's transcript is not part of any session's context.** Messages
 to the room's own JSONL, routing is computed from the ledger, and simply posting, reading the
 list, or clicking in the panel adds nothing to anyone's conversation. A session sees room
 content only when it asks (`attention_history`, `attention_digest`, `attention_group_list`'s
-one-line preview) or when a wake-up was deliberately delivered to it — and a wake-up is the
-one thing two switches must agree on first.
+one-line preview), when a wake-up was deliberately delivered to it, or when someone deliberately
+asked it for a summary. Nothing arrives because the room exists.
+
+### Why a long room does not blow up the token budget
+
+"Will a new agent be crushed by a year of chat history?" No, and not by luck:
+
+- **History never enters anyone's context on its own.** A new member writes one member record; not
+  a single historical message is sent to it. History is read only when asked for, through
+  `attention_history` — and that projection is bounded to 200 lines and 2000 characters per line,
+  and says how many older lines it left out. The transcript file itself is not touched.
+- **A wake-up carries the trigger, not the room.** A woken member receives the one message that
+  matched, the charter (at most 2000 characters) and the self-reflection instruction.
+- **Storage grows; context does not.** Transcripts are append-only JSONL that the plugin never
+  rewrites, and a line is a few hundred bytes (measured 224–494 bytes on real data). Ten thousand
+  messages is roughly 2–5 MB on disk — and still zero tokens until someone asks.
+
+The same reasoning is why the unread line publishes counts instead of text, and why a summary is a
+projection the room keeps rather than a replacement for its history.
 
 ---
 
@@ -412,6 +518,11 @@ Written down because they are true, not because they are small:
   profile still loads every other capability is `unverified`; the optional services are
   probed with `ctx.get()`, never declared as hard dependencies, so a missing one can only
   cost its own feature.
+- **A summary exists only once the manager writes it back.** Delivery into another session is
+  one-way, so the plugin cannot collect the answer itself. If the manager never calls
+  `attention_record_summary` — or the request is refused because the room has no usable
+  manager — nothing is stored and the reminder keeps counting. That is the honest outcome, and
+  why the panel reports what it did instead of promising a summary.
 - **DSB integration is deliberately shelved.** DSB is still changing in destructive ways, so
   no DSB support is implemented; the `liaison` member kind exists as the reserved place for
   it. Nothing else about DSB is claimed.

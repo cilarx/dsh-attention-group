@@ -102,13 +102,48 @@ function clampLine(text) {
   return `${text.slice(0, MAX_RENDER_LINE_CHARS)} … [line truncated here: ${dropped} more character(s) in the record; the durable log keeps everything]`
 }
 
+/**
+ * Hard cap on how many characters ONE rendered tool result may carry in total.
+ *
+ * The third budget, and the one that was missing until 2026-10-17: a line count
+ * bounds shape, a per-line cap bounds a single record, but 200 lines of 2000
+ * characters each is still 400,000 characters — roughly 100k tokens — replayed
+ * into every later request of the session. `attention_history` on a long room is
+ * exactly where that would happen, so the total is capped here, at the one point
+ * every render goes through, and the projection says how many lines it dropped.
+ */
+const MAX_RENDER_TOTAL_CHARS = 60000
+
 function textBlocks(lines) {
-  return lines.map((text) => ({ type: 'text', text: clampLine(String(text)) }))
+  const clamped = lines.map((text) => clampLine(String(text)))
+  let total = 0
+  for (const text of clamped) total += text.length + 1
+  if (total <= MAX_RENDER_TOTAL_CHARS) {
+    return clamped.map((text) => ({ type: 'text', text }))
+  }
+  // Keep the TAIL: for a transcript projection, the newest lines are the ones the
+  // reader needs; dropping them to save space would be the wrong trade.
+  const kept = []
+  let used = 0
+  for (let index = clamped.length - 1; index >= 0; index -= 1) {
+    const text = clamped[index]
+    if (used + text.length + 1 > MAX_RENDER_TOTAL_CHARS - 300) break
+    kept.push(text)
+    used += text.length + 1
+  }
+  kept.reverse()
+  return [
+    {
+      type: 'text',
+      text: `… ${clamped.length - kept.length} line(s) omitted from this view: one result is capped at ${MAX_RENDER_TOTAL_CHARS} characters because it is replayed into every later request; the durable log keeps everything.`,
+    },
+    ...kept.map((text) => ({ type: 'text', text })),
+  ]
 }
 
 /** One typed content block from a single line. */
 function textBlock(text) {
-  return [{ type: 'text', text: clampLine(String(text)) }]
+  return textBlocks([text])
 }
 
 /**
@@ -130,6 +165,16 @@ const MAX_RENDER_LINES = 200
  * so a new render cannot forget it.
  */
 const MAX_RENDER_LINE_CHARS = 2000
+
+/**
+ * How much text a stored room-history summary may hold.
+ *
+ * A summary is a projection, not a transcript dump. 8000 characters already
+ * covers a long stretch of a room; anything bigger means the caller pasted
+ * messages instead of summarising them, and that paste would then be re-read by
+ * every later reader — which is exactly what the summary exists to avoid.
+ */
+const MAX_SUMMARY_CHARS = 8000
 
 /** Short, readable group id from a title. */
 function slugify(title) {
@@ -2316,6 +2361,96 @@ function registerTools(ctx, state) {
     }),
   )
 
+  // ⚠️ Why this tool has to exist: delivery is ONE-WAY. `deliver()` hands a woken
+  // member a `followup` message, and this plugin never sees the answer it writes
+  // back. So a summary produced by the room's own manager has no way home unless
+  // the member hands it back itself — that is this tool, the write-back half of
+  // the manual 「生成群史摘要」 button (user decision 2026-10-17, memory d6).
+  //
+  // Recording a summary never wakes anybody, never deletes a message and never
+  // touches the transcript: it appends one snapshot to `group.summaries`.
+  ctx.tools.register(
+    defineTool({
+      name: 'attention_record_summary',
+      description:
+        "Store a room-history summary snapshot. Use it when you were asked to summarise a room (for example by the panel button 「生成群史摘要」): the summary you wrote is kept in the room record next to the message number it covers, while every original message stays exactly where it is. Recording is quiet — it wakes nobody and deletes nothing.",
+      parameters: {
+        groupId: { type: 'string', required: true, description: 'Which room the summary belongs to.' },
+        text: {
+          type: 'string',
+          required: true,
+          description: 'The summary itself. 300-800 characters is a good size; do not paste the transcript.',
+        },
+        upToSeq: {
+          type: 'number',
+          description: 'Last message number this summary covers. Omit to use the room\'s newest message.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean', required: true },
+            groupId: { type: 'string' },
+            upToSeq: { type: 'number' },
+            covered: { type: 'number' },
+            summaries: { type: 'number' },
+            error: { type: 'string' },
+          },
+        },
+        render: (_args, value) =>
+          value.ok === true
+            ? textBlock(
+                `summary stored in 「${String(value.groupId)}」: covers up to #${String(value.upToSeq)} (${String(value.covered)} message(s) summarised); the room now has ${String(value.summaries)} snapshot(s). No message was deleted.`,
+              )
+            : textBlock(`summary not stored: ${value.error ?? 'unknown error'}`),
+      },
+      execute(args, exec) {
+        let group
+        try {
+          group = requireGroup(state.ledger, args.groupId)
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) }
+        }
+        const text = String(args.text ?? '').trim()
+        if (text.length === 0) return { ok: false, error: 'text is required: the summary itself' }
+        if (text.length > MAX_SUMMARY_CHARS) {
+          return {
+            ok: false,
+            error: `text is ${text.length} characters; a summary must be at most ${MAX_SUMMARY_CHARS} — summarise it, do not paste the transcript`,
+          }
+        }
+        const all = readMessages(state.root, group.id, { limit: 0 })
+        const latestSeq = all.reduce(
+          (max, row) => (Number.isFinite(row.seq) && row.seq > max ? row.seq : max),
+          0,
+        )
+        if (latestSeq === 0) {
+          return { ok: false, error: 'this room has no messages yet, so there is nothing to summarise' }
+        }
+        const wanted = Number.isFinite(args.upToSeq) ? Math.floor(args.upToSeq) : latestSeq
+        const upToSeq = Math.max(0, Math.min(wanted, latestSeq))
+        if (upToSeq === 0) return { ok: false, error: 'upToSeq must be a message number greater than 0' }
+        const already = summarizedUpTo(group)
+        const covered = all.filter(
+          (row) => Number.isFinite(row.seq) && row.seq > already && row.seq <= upToSeq,
+        ).length
+        const record = {
+          upToSeq,
+          at: new Date().toISOString(),
+          by: memberNameOf(group, exec?.agent),
+          text,
+          covered,
+        }
+        if (!Array.isArray(group.summaries)) group.summaries = []
+        group.summaries.push(record)
+        writeLedger(state.root, state.ledger)
+        return { ok: true, groupId: group.id, upToSeq, covered, summaries: group.summaries.length }
+      },
+    }),
+  )
+
   ctx.tools.register(
     defineTool({
       name: 'attention_digest',
@@ -2758,6 +2893,176 @@ function registerTools(ctx, state) {
       },
     }),
   )
+}
+
+const GROUP_COMMAND_USAGE = [
+  '用法：/group <子命令>',
+  '  list                 列出所有房间 + 你的未读数',
+  '  say <群> <内容>       以你的名义发言（不叫醒任何人）',
+  '  today <群>           本地统计「今天」聊了什么（不调模型）',
+  '群可以用 id 或标题指定；标题有歧义时用 id。',
+].join('\n')
+
+/**
+ * Find a room by id, else by exact title (case-insensitive).
+ *
+ * @param {object[]} groups - ledger rooms.
+ * @param {string} target - what the human typed.
+ * @returns {object|undefined} the room.
+ */
+function findGroupByTarget(groups, target) {
+  const wanted = String(target ?? '').trim()
+  if (wanted.length === 0) return undefined
+  const byId = groups.find((group) => group.id === wanted)
+  if (byId !== undefined) return byId
+  const lower = wanted.toLowerCase()
+  return groups.find((group) => String(group.title ?? '').toLowerCase() === lower)
+}
+
+/**
+ * Implement `/group`.
+ *
+ * Shape notes (read from the runtime's own `commands` contract, 2026-10-17):
+ * `handler(invocation) -> {kind:'success', text?} | {kind:'error', text}` and
+ * `invocation` carries `agent` (the session it was typed in), `rawInput`, `signal`.
+ *
+ * Two deliberate rules:
+ *  - **A typed command never wakes anybody.** `/group say` writes the message and
+ *    records its mentions, but waking stays behind the explicit wake switch; the
+ *    keyboard is not a reason to start turns in N sessions.
+ *  - **Errors are answers, not throws.** A wrong room name comes back as
+ *    `{kind:'error', text}` naming the rooms that exist.
+ *
+ * @param {object} state - plugin state.
+ * @param {object} invocation - CommandInvocation from the runtime.
+ * @returns {object} CommandResult.
+ */
+function runGroupCommand(state, invocation) {
+  const fail = (text) => ({ kind: 'error', text })
+  const raw = typeof invocation?.rawInput === 'string' ? invocation.rawInput.trim() : ''
+  if (raw.length === 0) return { kind: 'success', text: GROUP_COMMAND_USAGE }
+  const space = raw.indexOf(' ')
+  const command = (space === -1 ? raw : raw.slice(0, space)).toLowerCase()
+  const rest = space === -1 ? '' : raw.slice(space + 1).trim()
+  const sessionId = invocation?.agent?.id === undefined ? undefined : String(invocation.agent.id)
+  const groups = state.ledger.groups
+
+  const unreadOf = (group) => {
+    if (sessionId === undefined) return undefined
+    const member = safeMembers(group).find((row) => row?.id === sessionId)
+    if (member === undefined) return undefined
+    try {
+      return countUnread(state.root, group.id, member)
+    } catch {
+      return undefined
+    }
+  }
+
+  if (command === 'list' || command === 'ls') {
+    if (groups.length === 0) return { kind: 'success', text: '还没有任何群。' }
+    const lines = [`群聊（${groups.length} 个）`]
+    for (const group of groups) {
+      const unread = unreadOf(group)
+      lines.push(
+        `${unread === undefined ? '·' : `[${unread}]`} ${singleLine(group.title, 60)}  (${group.id}, ${safeMembers(group).length} 人)`,
+      )
+    }
+    return { kind: 'success', text: lines.join('\n') }
+  }
+
+  if (command === 'say' || command === 'send') {
+    const split = rest.indexOf(' ')
+    if (split === -1) return fail(`用法：/group say <群> <内容>\n\n${GROUP_COMMAND_USAGE}`)
+    const target = rest.slice(0, split).trim()
+    const text = rest.slice(split + 1).trim()
+    if (text.length === 0) return fail('内容不能为空')
+    const group = findGroupByTarget(groups, target)
+    if (group === undefined) {
+      return fail(
+        `找不到群「${target}」。现有的群：${groups.map((row) => row.title).join('、') || '（没有）'}`,
+      )
+    }
+    const names = safeMembers(group)
+      .map((member) => member?.name)
+      .filter((name) => typeof name === 'string' && name.length > 0)
+    const record = {
+      seq: nextSeq(state.root, group.id),
+      at: new Date().toISOString(),
+      fromId: 'user',
+      fromName: '用户',
+      text,
+      kind: 'message',
+      mentions: extractMentions(text, names),
+    }
+    appendMessage(state.root, group.id, record)
+    return {
+      kind: 'success',
+      text: `已在「${group.title}」发言（#${record.seq}${record.mentions.length > 0 ? `，提到 ${record.mentions.join('、')}` : ''}）。没有叫醒任何人 —— 唤醒是另一个显式动作。`,
+    }
+  }
+
+  if (command === 'today') {
+    if (rest.length === 0) return fail(`用法：/group today <群>\n\n${GROUP_COMMAND_USAGE}`)
+    const group = findGroupByTarget(groups, rest)
+    if (group === undefined) {
+      return fail(`找不到群「${rest}」。现有的群：${groups.map((row) => row.title).join('、') || '（没有）'}`)
+    }
+    const range = resolveRange({ range: 'today' })
+    if (range.invalid !== undefined) return fail(`时间范围无法解析：${range.invalid}`)
+    const all = readMessages(state.root, group.id, { limit: 0 })
+    const digest = buildDigest({ group, messages: all, since: range.since, until: range.until })
+    if (digest.total === 0) return { kind: 'success', text: `「${group.title}」今天还没有消息。` }
+    const text =
+      digest.text.length > MAX_RENDER_TOTAL_CHARS
+        ? `${digest.text.slice(0, MAX_RENDER_TOTAL_CHARS)}\n…（已按 ${MAX_RENDER_TOTAL_CHARS} 字符截断；完整记录还在日志里）`
+        : digest.text
+    return { kind: 'success', text }
+  }
+
+  return fail(`不认识的子命令「${command}」\n\n${GROUP_COMMAND_USAGE}`)
+}
+
+/**
+ * Register `/group` with the runtime's human-command registry.
+ *
+ * Same two disciplines as the other registrations: `ctx.inject` because the
+ * service is not in this plugin's own scope (c8), and `scope.effect` so a
+ * re-activated child fiber replaces the command instead of piling up (c23).
+ * A deployment without `commands` loses only the slash command.
+ *
+ * @param {object} ctx - Cordis context.
+ * @param {object} state - plugin state.
+ */
+function registerCommands(ctx, state) {
+  if (typeof ctx.inject !== 'function') {
+    state.commandStatus = 'ctx.inject is unavailable'
+    return
+  }
+  try {
+    ctx.inject(['commands'], (scope) => {
+      const registry = scope.commands
+      if (registry === undefined || registry === null || typeof registry.register !== 'function') {
+        state.commandStatus = 'commands child context carried no service'
+        return
+      }
+      scope.effect(() => {
+        const dispose = registry.register({
+          definitionId: 'attention-group/group',
+          name: 'group',
+          description: 'Group chat: list rooms, say something, or summarise today — without opening the panel.',
+          input: { hint: '<subcommand> [args]' },
+          handler: (invocation) => runGroupCommand(state, invocation),
+        })
+        state.commandStatus = 'registered'
+        return () => {
+          state.commandStatus = 'disposed'
+          if (typeof dispose === 'function') dispose()
+        }
+      }, 'attention-group: /group command')
+    })
+  } catch (error) {
+    state.commandStatus = `inject failed: ${errorMessage(error)}`
+  }
 }
 
 /**
@@ -3317,6 +3622,75 @@ async function applyPanelAction(state, body) {
     return done({ summaryEvery: wanted })
   }
 
+  // ⚠️ THE ONE PANEL ACTION THAT CAN START A TURN — and only because the human
+  // clicked 「生成群史摘要」 on purpose; a summary costs a model call in someone
+  // else's session. Two guards keep the "panel never wakes anybody" promise
+  // meaningful: the room must have a usable admin session to write it, and the
+  // room's own waking switch must be on. With waking off the button refuses and
+  // says so, so a click can never turn a silent room noisy by accident.
+  if (action === 'summaryGenerate') {
+    const summarizer = safeMembers(group).find(
+      (member) => member?.kind === 'admin' && member.enabled !== false && isSessionId(member.id),
+    )
+    if (summarizer === undefined) {
+      return {
+        ok: false,
+        error: '这个群还没有可用的群管理成员：需要 kind=admin 且本身是 DSH 会话，摘要由它来写',
+      }
+    }
+    if (group.wakeEnabled !== true) {
+      return {
+        ok: false,
+        error: '这个群的唤醒开关是关的：生成摘要必须先叫醒群管理，请先在面板打开唤醒，再点这个按钮',
+      }
+    }
+    const all = readMessages(state.root, group.id, { limit: 0 })
+    const latestSeq = all.reduce((max, row) => (Number.isFinite(row.seq) && row.seq > max ? row.seq : max), 0)
+    const from = summarizedUpTo(group)
+    const slice = all.filter((row) => Number.isFinite(row.seq) && row.seq > from)
+    if (slice.length === 0) {
+      return {
+        ok: false,
+        error: `这个群没有未摘要的消息（已有摘要覆盖到第 ${from} 条），不需要生成`,
+      }
+    }
+    const digest = buildDigest({ group, messages: slice, since: '', until: '' })
+    const record = {
+      seq: nextSeq(state.root, group.id),
+      at: new Date().toISOString(),
+      fromId: 'panel',
+      fromName: '面板',
+      text: `请 ${summarizer.name} 生成群史摘要（${slice.length} 条，截至第 ${latestSeq} 条）`,
+      kind: 'summary-request',
+      mentions: [summarizer.name],
+    }
+    appendMessage(state.root, group.id, record)
+    // Tell it EXACTLY how to hand the summary back: delivery is one-way, so a
+    // summary that is not recorded through the tool would be lost.
+    const request =
+      renderSummaryRequest({ group, digest, requester: '面板' }) +
+      `\n\n【写回方式】摘要写完后，调用 attention_record_summary 登记回群里：groupId="${group.id}"，text=<你的摘要>，upToSeq=${latestSeq}。摘要 300-800 字，不要贴原文。`
+    const outcome = await deliver(
+      state.ctx,
+      state,
+      group,
+      summarizer,
+      record,
+      { reason: REASON.summary, detail: `${slice.length} message(s)` },
+      request,
+    )
+    return {
+      ok: true,
+      summarizerId: summarizer.id,
+      summarizerName: summarizer.name,
+      messages: slice.length,
+      upToSeq: latestSeq,
+      delivered: outcome.delivered === true,
+      path: outcome.path,
+      ...(outcome.note === undefined ? {} : { note: outcome.note }),
+    }
+  }
+
   if (action === 'joinPolicy') {
     const legal = PANEL_KNOBS.joinPolicies.map((row) => row.value)
     const policy = String(body?.joinPolicy ?? '')
@@ -3532,6 +3906,12 @@ function apply(ctx) {
     console.warn(`${name}: group ledger was unreadable and moved to ${recoveredFrom}; starting from an empty ledger`)
   }
   registerTools(ctx, state)
+  // One panel action (生成群史摘要) has to start a turn, and starting a turn needs
+  // the Cordis context. Keeping the reference on `state` is the smallest honest
+  // way to give the route handler what it needs without threading ctx through
+  // four signatures; it is the SAME context this apply() was called with.
+  state.ctx = ctx
+  registerCommands(ctx, state)
   registerWebRoute(ctx, state)
   registerPromptContext(ctx, state)
   registerSessionController(ctx, state)

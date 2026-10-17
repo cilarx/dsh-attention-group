@@ -717,6 +717,11 @@ window.__ModuleLoader__.load({
       var [pendingRemove, setPendingRemove] = useState('')
       var [sinkDirDraft, setSinkDirDraft] = useState(null)
       var [exportNote, setExportNote] = useState('')
+      // The summary button is ASYNC on purpose: it wakes the room's manager, and
+      // the summary comes back only when that turn ends and the manager stores it
+      // with attention_record_summary. So the panel reports "requested", never
+      // "done" — claiming otherwise would be the classic lie (c7).
+      var [summaryNote, setSummaryNote] = useState('')
       var [digestText, setDigestText] = useState('')
       var [linkTarget, setLinkTarget] = useState('')
       var [linkMode, setLinkMode] = useState('conclusion')
@@ -1160,6 +1165,28 @@ window.__ModuleLoader__.load({
           })
           .catch(function (error) {
             setExportNote('')
+            fail(error)
+          })
+      }
+
+      function generateSummary() {
+        if (state.group === null) return
+        setSummaryNote('已请求，等群管理写回…')
+        act({ action: 'summaryGenerate', group: state.group.id })
+          .then(function (data) {
+            var head =
+              '已请求 ' +
+              str(data.summarizerName, '群管理') +
+              ' 生成摘要（' + countOf(data.messages) + ' 条，截至第 ' + countOf(data.upToSeq) + ' 条）'
+            var tail =
+              data.delivered === true
+                ? '已投递；它写完后会用 attention_record_summary 登记回群记录'
+                : '未投递：' + str(data.note, '原因未报告')
+            setSummaryNote(head + ' · ' + tail)
+            return again()
+          })
+          .catch(function (error) {
+            setSummaryNote('')
             fail(error)
           })
       }
@@ -1813,6 +1840,24 @@ window.__ModuleLoader__.load({
                           ' 条）。要不要摘要由你决定 —— 插件不会自己压缩，也不会删任何历史。',
                       )
                     : null,
+                  h(
+                    'div',
+                    { style: S.memberRow },
+                    h('button', { style: S.button, onClick: generateSummary }, '生成群史摘要'),
+                    group.summary && group.summary.count > 0
+                      ? h(
+                          'div',
+                          { style: S.fieldHint },
+                          '已有 ' + countOf(group.summary.count) + ' 份摘要，最新覆盖到第 ' + countOf(group.summary.upToSeq) + ' 条',
+                        )
+                      : null,
+                  ),
+                  h(
+                    'div',
+                    { style: S.fieldHint },
+                    '会叫醒群管理写一次摘要（花一次模型调用，用那个会话自己的模型）。异步：点完不会立刻有结果。',
+                  ),
+                  summaryNote.length > 0 ? h('div', { style: S.fieldHint }, summaryNote) : null,
                 ),
               ),
               h(

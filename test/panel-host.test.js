@@ -91,6 +91,49 @@ test('an opted-in room announces its unread count in the member prompt, and only
   assert.equal(lineFor(memberId), '')
 })
 
+test('/group is a real human command, and typing it never wakes anybody', async () => {
+  boot()
+  const groupId = await newRoom('命令测试群')
+  const command = host.commands.get('group')
+  assert.ok(command !== undefined, 'the runtime command registry must see /group')
+
+  const listed = await command.handler({ rawInput: 'list', agent: { id: 'session-abc' } })
+  assert.equal(listed.kind, 'success')
+  assert.match(listed.text, /命令测试群/)
+
+  const said = await command.handler({ rawInput: 'say 命令测试群 你好', agent: { id: 'session-abc' } })
+  assert.equal(said.kind, 'success')
+  assert.equal(host.messagesOnDisk(groupId).trim().split('\n').length, 1, 'the message must land on disk')
+
+  const bad = await command.handler({ rawInput: 'say 不存在的群 你好', agent: { id: 'session-abc' } })
+  assert.equal(bad.kind, 'error')
+  assert.match(bad.text, /找不到群/)
+
+  const unknown = await command.handler({ rawInput: 'nope', agent: { id: 'session-abc' } })
+  assert.equal(unknown.kind, 'error')
+  assert.match(unknown.text, /用法/)
+
+  assert.equal(host.delivered.length, 0, 'a typed command is not a reason to start a turn')
+})
+
+test('the summary button refuses clearly when the room cannot produce one', async () => {
+  boot()
+  const groupId = await newRoom('摘要按钮群')
+  // No admin member at all — the reason must name the member, not a generic failure.
+  const noAdmin = await post({ action: 'summaryGenerate', group: groupId })
+  assert.equal(noAdmin.status, 400)
+  assert.match(noAdmin.json.error, /群管理/)
+
+  // An admin exists, but this room's waking switch is off: the button must not be
+  // the thing that turns a silent room noisy by accident.
+  await post({ action: 'join', group: groupId, memberId: 'session-admin-0001', memberName: '群管理', kind: 'admin' })
+  await post({ action: 'post', group: groupId, text: '一条消息' })
+  const noWake = await post({ action: 'summaryGenerate', group: groupId })
+  assert.equal(noWake.status, 400)
+  assert.match(noWake.json.error, /唤醒/)
+  assert.equal(host.delivered.length, 0, 'and nothing may be woken on the refusal path')
+})
+
 test('the summary reminder counts un-summarised messages and never acts on its own', async () => {
   // The user's decision (2026-10-17): remind at a limit, but never compact by
   // itself. A summary costs a model turn in someone else's session, so the panel
