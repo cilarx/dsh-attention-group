@@ -1290,6 +1290,10 @@ function registerTools(ctx, state) {
           panelRoute: {
             path: '/attention-group',
             status: typeof state.routeStatus === 'string' ? state.routeStatus : 'not attempted',
+            // >1 means the inject child fiber activated more than once. That is
+            // normal (a dependency can be re-composed); the registration is
+            // idempotent, so the last activation owns the live route.
+            ...(state.routeAttempts > 0 ? { activations: state.routeAttempts } : {}),
           },
           // The one caller of `transcriptGroupIds`. A transcript whose room is not
           // in the ledger is history the user still has: after a corrupt-ledger
@@ -2668,6 +2672,24 @@ function registerPanelRoute(webServer, state) {
     })
 
   try {
+    // ⚠️ Registration must be IDEMPOTENT. A Cordis `ctx.inject` child fiber can
+    // activate more than once (a dependency is re-composed, or the web entry
+    // reloads), and an unguarded second `webServer.register` for the same exact
+    // path throws `webserver: duplicate exact route` — measured on 0.2.1-rc.1 at
+    // boot. The route from the FIRST activation stayed alive, so the panel kept
+    // working while `state.routeStatus` said `failed: …duplicate…`: the panel was
+    // healthy and the diagnostic lied about it, which is exactly what the c7
+    // rule forbids. Disposing the previous registration first makes the LAST
+    // activation the only live one, so the status line and the route agree.
+    if (typeof state.disposeRoute === 'function') {
+      try {
+        state.disposeRoute()
+      } catch {
+        // The previous route was already gone; nothing to release.
+      }
+      state.disposeRoute = undefined
+    }
+    state.routeAttempts = (state.routeAttempts ?? 0) + 1
     state.disposeRoute = webServer.register({
       kind: 'exact',
       path: '/attention-group',

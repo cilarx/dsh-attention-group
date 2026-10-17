@@ -48,6 +48,24 @@ test('the panel route registers as an exact path', () => {
   assert.equal(typeof route.handler, 'function')
 })
 
+test('a re-activated child fiber re-registers the route instead of failing on a duplicate', async () => {
+  // Cordis can activate an `ctx.inject` child fiber more than once (the web
+  // entry reloads, a dependency is re-composed). Measured on 0.2.1-rc.1 at boot:
+  // the second `webServer.register` threw `duplicate exact route`, the FIRST
+  // route stayed live, and the only casualty was the probe — which then reported
+  // a working panel as `failed: …duplicate…`. The fix releases the previous
+  // registration first; this test pins it.
+  boot()
+  const first = host.route
+  assert.ok(first !== null)
+  host.reactivate()
+  assert.equal(host.routeCount, 1, 'exactly one live registration after re-activation')
+  assert.notEqual(host.route, first, 'the most recent activation owns the live route')
+  const response = await get()
+  assert.equal(response.status, 200)
+  assert.equal(response.json.ok, true)
+})
+
 test('one GET returns the room list, per-room unread, and the knob table', async () => {
   boot()
   const groupId = await newRoom('读模型群')

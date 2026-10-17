@@ -61,6 +61,32 @@ export async function createHost(options = {}) {
   let home = ''
   let route = null
   let tools = new Map()
+  // The deployment's real route registry, including its duplicate guard: the
+  // host's `webServer.register` THROWS on a second registration of the same
+  // exact path (`webserver: duplicate exact route`). Modelling the throw is what
+  // turns "a re-activated child fiber must not lose the panel" into a test.
+  let registrations = []
+  // Every `ctx.inject` callback, kept so a test can re-activate the child fiber
+  // the way Cordis does when a dependency is re-composed.
+  let injects = []
+
+  // The deployment's real `webServer` face, hoisted out of `reboot()` so that
+  // `reactivate()` can hand the SAME service object back to the child fiber.
+  const webServer = {
+    register(definition) {
+      const clash = registrations.some(
+        (row) => row.kind === definition.kind && row.path === definition.path,
+      )
+      if (clash) throw new Error(`webserver: duplicate ${definition.kind} route "${definition.path}"`)
+      registrations.push(definition)
+      route = definition
+      return () => {
+        const index = registrations.indexOf(definition)
+        if (index >= 0) registrations.splice(index, 1)
+        if (route === definition) route = null
+      }
+    },
+  }
 
   /** A fresh data root plus a freshly applied plugin, as a restart would give. */
   function boot() {
@@ -73,6 +99,10 @@ export async function createHost(options = {}) {
   function reboot() {
     process.env.DSH_HOME = home
     route = null
+    // A reboot disposes the previous plugin instance, and Cordis runs its
+    // disposers: the old route is gone before the new apply runs.
+    registrations = []
+    injects = []
     tools = new Map()
     for (const name of extraTools) {
       tools.set(name, {
@@ -130,14 +160,8 @@ export async function createHost(options = {}) {
       },
       inject(names, cb) {
         if (names.includes('webServer')) {
-          cb({
-            webServer: {
-              register(definition) {
-                route = definition
-                return () => {}
-              },
-            },
-          })
+          injects.push(cb)
+          cb({ webServer })
         }
         // A deployment without `sessionController` never calls back at all — which
         // is what a headless tree looks like, and the state most tests should be
@@ -155,6 +179,17 @@ export async function createHost(options = {}) {
       },
     }
     apply(ctx)
+  }
+
+  /**
+   * Re-run each `ctx.inject` callback, as Cordis does when a dependency is
+   * re-composed or the web entry reloads. The plugin must treat that as
+   * idempotent — measured on 0.2.1-rc.1: the second activation threw
+   * `duplicate exact route`, the panel survived on the FIRST registration, and
+   * only the diagnostic knew, so it reported a healthy panel as failed.
+   */
+  function reactivate() {
+    for (const cb of injects) cb({ webServer })
   }
 
   /** Drive the real handler with a request, and parse what it wrote back. */
@@ -202,6 +237,7 @@ export async function createHost(options = {}) {
   return {
     boot,
     reboot,
+    reactivate,
     call,
     get,
     post,
@@ -225,6 +261,10 @@ export async function createHost(options = {}) {
     },
     get route() {
       return route
+    },
+    /** How many route registrations are live right now (must never exceed 1). */
+    get routeCount() {
+      return registrations.length
     },
     tool(name) {
       return tools.get(name)

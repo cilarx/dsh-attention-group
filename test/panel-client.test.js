@@ -742,3 +742,33 @@ test('the panel renders the REAL host read model, and a drag lands in the ledger
     host.cleanup()
   }
 })
+
+test('every CSS variable the panel reads is a real DSH theme token', () => {
+  // A wrong token name is INVISIBLE: `var(--typo, <fallback>)` silently uses the
+  // fallback, so the panel never follows the light/dark theme and nothing fails.
+  // That is exactly what shipped: `--dsh-border`, `--dsh-surface-2` and
+  // `--dsh-accent` do not exist in DSH 0.2.1 (measured 2026-10-17 with the Theme
+  // inspect provider — the string `--dsh-accent` does not appear in app.asar at
+  // all, while the real prefix `--dsw-alias-*` does). The allowlist below is that
+  // provider's token list; a new token must be added here deliberately.
+  const TOKENS = new Set([
+    '--dsw-alias-bg-base',
+    '--dsw-alias-bg-layer-1',
+    '--dsw-alias-bg-layer-2',
+    '--dsw-alias-bg-overlay',
+    '--dsw-alias-border-l1',
+    '--dsw-alias-border-l2',
+    '--dsw-alias-brand-primary',
+    '--dsw-alias-label-primary',
+    '--dsw-alias-label-secondary',
+    '--dsw-alias-state-error-primary',
+    '--dsw-alias-state-idle-primary',
+    '--dsw-alias-state-success-primary',
+    '--dsw-alias-state-warn-primary',
+    '--dsw-specific-sidebar-fill',
+  ])
+  const used = [...SOURCE.matchAll(/var\((--[A-Za-z0-9-]+)/g)].map((match) => match[1])
+  assert.ok(used.length > 0, 'the panel should be themed by the deployment, not only by literals')
+  const unknown = [...new Set(used)].filter((token) => !TOKENS.has(token))
+  assert.deepEqual(unknown, [], `unknown theme token(s): ${unknown.join(', ')}`)
+})
