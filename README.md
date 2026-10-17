@@ -46,8 +46,8 @@ Three consequences that are design rules here, not accidents:
 
 ### What you need
 
-- DSH **0.2.1-rc.1** (this is the version every interface here was verified against; it was
-  first built against 0.2.0-rc.2 and re-verified against 0.2.1-rc.1).
+- DSH **0.2.1-rc.2** (this is the version every interface here was last verified against; it was
+  first built against 0.2.0-rc.2, re-verified on 0.2.1-rc.1, and re-checked on 0.2.1-rc.2).
 - A profile to install into. The examples below use `--profile desktop`.
 
 ### Install
@@ -505,8 +505,8 @@ projection the room keeps rather than a replacement for its history.
 
 Written down because they are true, not because they are small:
 
-- **DSH version.** Everything here was verified on **DSH 0.2.1-rc.1**, and re-checked against it
-  after the 0.2.0-rc.2 → 0.2.1-rc.1 upgrade: every service this plugin reads is still present and
+- **DSH version.** Everything here was most recently verified on **DSH 0.2.1-rc.2** (and before that
+  re-checked after the 0.2.0-rc.2 → 0.2.1-rc.1 upgrade): every service this plugin reads is still present and
   the session format is still v4. That check was done by reading the running runtime, not by
   assuming — `agents.resume` still takes `{resumeSessionId, agentOptions, setup}`, the message
   `source.kind` rule still accepts any producer-owned kind except the retired `"plugin"`, and the
