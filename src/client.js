@@ -508,7 +508,12 @@ window.__ModuleLoader__.load({
         background: 'var(--dsh-surface-2, rgba(127,127,127,.1))',
       },
       memberTop: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' },
-      memberName: { fontWeight: 600, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      // ⚠️ Names wrap; they do not ellipsize. A member name like
+      // `Agent会话群聊专项DSH Agent` is normal here, and cutting it to
+      // `Agent会话群聊专项 D` makes two different agents look like one. The row
+      // above already wraps, so a long name costs a second line instead of
+      // hiding who it is. Reported by the user 2026-10-17.
+      memberName: { fontWeight: 600, flex: '1 1 240px', minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' },
       tag: {
         fontSize: '10px',
         padding: '1px 6px',
@@ -517,7 +522,7 @@ window.__ModuleLoader__.load({
         opacity: 0.7,
       },
       memberId: { fontSize: '10px', opacity: 0.45, wordBreak: 'break-all', marginTop: '2px' },
-      memberRow: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px' },
+      memberRow: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '6px', flexWrap: 'wrap' },
       small: { flex: '1 1 auto', minWidth: 0, padding: '4px 8px', borderRadius: '6px', border: '1px solid var(--dsh-border, rgba(127,127,127,.28))', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: '12px' },
       digestBar: {
         display: 'flex',
@@ -1533,7 +1538,7 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: S.memberTop },
-                h('span', { style: S.memberName }, str(item.name, str(item.id, '（没有 id 的成员）'))),
+                h('span', { style: S.memberName, title: str(item.name, str(item.id, '')) }, str(item.name, str(item.id, '（没有 id 的成员）'))),
                 h('span', { style: S.tag }, str(item.kind, 'session')),
                 h('span', { style: S.tag }, item.wakeable === true ? '可唤醒' : '只记录'),
                 item.enabled === false ? h('span', { style: S.tag }, '已休眠') : null,
@@ -1628,7 +1633,7 @@ window.__ModuleLoader__.load({
                     'div',
                     { style: S.memberRow },
                     h('input', {
-                      style: S.small,
+                      style: Object.assign({}, S.small, { flex: '1 1 100%' }),
                       value: memberNameOf(item),
                       placeholder: '这个成员在群里的名字（@用的就是它）',
                       onChange: function (event) {
@@ -1707,18 +1712,18 @@ window.__ModuleLoader__.load({
                     {
                       style: S.ghost,
                       title:
-                        '打开后，上面的滑块会立刻改这个群里正在活着的会话（下一个 step 生效）。' +
-                        '注意：这个调用会顺带把「部署默认模型」也改成同样的选择 —— 所以默认是关的。',
+                        '关着：只影响「以后被叫醒」的成员。打开：正在运行的成员也立刻改（从下一个回合开始），' +
+                        '并且会顺带把本机默认使用的模型（部署默认模型）也改成这个强度。',
                       onClick: toggleLiveEffort,
                     },
-                    '也改活会话：' + tri(group.liveEffort),
+                    '立刻改正在运行的成员：' + tri(group.liveEffort),
                   ),
                   h(
                     'span',
                     { style: S.fieldHint },
                     group.effortStatus === 'available'
-                      ? '这个部署支持改活会话。'
-                      : '这个部署没有 sessionController（' + str(group.effortStatus, '未报告') + '），所以只能影响掉线后被叫醒的会话。',
+                      ? '这个部署支持直接改正在运行的会话。'
+                      : '这个部署不支持（' + str(group.effortStatus, '未报告') + '），所以这个开关只能对掉线后被叫醒的成员生效。',
                   ),
                 ),
                 // C-04: the side effect lived only in the tooltip. It changes the
@@ -1726,8 +1731,10 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { style: S.fieldHint },
-                  '注意：打开后，上面的滑块会顺带把「部署默认模型」也改成同样的选择 —— 所以默认是关的。' +
-                    (group.liveEffort === true ? '已生效：本群活会话与部署默认模型都会跟着这个旋钮走。' : ''),
+                  '说明：关着的时候，上面的滑块只对「以后被叫醒」的成员生效 —— 正在运行的成员不受影响。' +
+                    '打开后，正在运行的成员也立刻改（从下一个回合开始），' +
+                    '并且会顺带把本机默认使用的模型（部署默认模型）也改成这个强度，所以默认是关的。' +
+                    (group.liveEffort === true ? ' 已生效：本群正在运行的成员与本机默认模型都会跟着这个旋钮走。' : ''),
                 ),
                 // C-05: the host reports what it actually did; silence was the bug.
                 effortNote !== '' ? h('div', { style: Object.assign({}, S.fieldHint, { opacity: 0.9 }) }, effortNote) : null,
@@ -1759,19 +1766,30 @@ window.__ModuleLoader__.load({
               ),
               h(
                 Field,
-                { label: '群规', hint: '成员被叫醒时会在消息里看到这段。写「什么该说、什么不该说」比写「要友好」有用。' },
+                {
+                  label: '群用途及群规',
+                  hint:
+                    '成员被叫醒时会在消息里看到这段。先写清「这个群是干什么的」，再写规矩 —— ' +
+                    '一个 AI 进群后，只能靠这段知道该不该发言、说到什么程度。',
+                },
                 h(
                   'div',
                   null,
                   h('textarea', {
                     style: S.textarea,
                     value: charterDraft === null ? group.charter : charterDraft,
-                    placeholder: '例如：只在被 @ 或涉及发布流程时发言；不需要发言就回一行「无需参与」。',
+                    placeholder:
+                      '这个群是干什么的：\n' +
+                      '例：自由讨论群 —— 大家交流信息、可以畅所欲言；没话要说就回一行「无需参与」。\n' +
+                      '或：只发通知的群 —— 这里只发结果和公告，不需要任何人回应。\n' +
+                      '\n' +
+                      '规矩：\n' +
+                      '例：不要复述别人已经说过的内容；涉及发布流程必须 @ 群管理确认。',
                     onChange: function (event) {
                       setCharterDraft(event.target.value)
                     },
                   }),
-                  h('button', { style: Object.assign({}, S.ghost, { marginTop: '6px' }), onClick: saveCharter }, '保存群规'),
+                  h('button', { style: Object.assign({}, S.ghost, { marginTop: '6px' }), onClick: saveCharter }, '保存群用途及群规'),
                 ),
               ),
               h(

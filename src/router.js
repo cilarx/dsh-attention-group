@@ -223,6 +223,27 @@ export function renderWakeMessage(input) {
   if (typeof input.unread === 'number' && input.unread > 1) {
     lines.push(`（你上次查看后有 ${input.unread} 条新消息，这里是触发你的那条；完整历史用 attention_history 读。）`)
   }
+
+  // ⚠️ THE CHARTER WAS NEVER ACTUALLY SENT.
+  //
+  // `attention_group_create`'s own description promises "Room charter shown to
+  // every member when it is woken". The panel let you edit it. The ledger stored
+  // it. And this function — the ONLY thing that actually speaks to a woken member
+  // — never read it. So the one piece of text that tells an agent what the room is
+  // FOR and how to behave never reached the agent it was written for. Reported by
+  // the user on 2026-10-17: "each AI entering should know what this group is for".
+  //
+  // NOT flattened: paragraph breaks are part of what a purpose statement says, and
+  // a charter read as one run-on line loses the point. It IS length-capped, since
+  // it is replayed to a model on every wake.
+  const charter = typeof group.charter === 'string' ? group.charter.trim() : ''
+  if (charter.length > 0) {
+    const MAX_CHARTER = 2000
+    lines.push('')
+    lines.push('【这个群是干什么的 / 群规】')
+    lines.push(charter.length > MAX_CHARTER ? `${charter.slice(0, MAX_CHARTER)} …（群规过长，此处截断）` : charter)
+  }
+
   lines.push('')
   lines.push(message.text)
   lines.push('')

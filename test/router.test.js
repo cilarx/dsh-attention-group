@@ -249,3 +249,32 @@ test('B-13: there is no admin wake reason, because nothing ever produces one', (
   assert.equal(Object.hasOwn(REASON, 'admin'), false, 'REASON.admin was dead code and must stay removed')
   assert.equal(Object.hasOwn(REASON, 'summary'), true, 'summary IS produced, by attention_summarize')
 })
+
+test('the room charter reaches a woken member — it is the only way it can know what the room is for', () => {
+  // Reported by the user 2026-10-17: "each AI entering should know what this group
+  // is for". The charter was editable in the panel, stored in the ledger, and
+  // promised by the tool's own description ("Room charter shown to every member
+  // when it is woken") — but `renderWakeMessage`, the only thing that actually
+  // speaks to a woken member, never read it. So the one piece of text written ON
+  // that member's behalf never reached the member.
+  const text = renderWakeMessage({
+    group: group({ charter: '这个群只发结果和公告，不需要任何人回应。\n规矩：不要复述别人说过的话。' }),
+    message: { fromName: 'Bob', text: 'hi' },
+    reason: REASON.mention,
+    selfReflect: false,
+  })
+  assert.match(text, /这个群只发结果和公告/, 'the purpose must reach the member')
+  assert.match(text, /不要复述别人说过的话/, 'and the rules must reach it too')
+  // Multi-line charters keep their line breaks: a purpose read as one run-on line
+  // loses the point.
+  assert.match(text, /不需要任何人回应。\n规矩：/, 'a charter keeps its paragraphs')
+
+  // A room with no charter must not grow an empty section.
+  const bare = renderWakeMessage({
+    group: group({ charter: '' }),
+    message: { fromName: 'Bob', text: 'hi' },
+    reason: REASON.mention,
+    selfReflect: false,
+  })
+  assert.doesNotMatch(bare, /这个群是干什么的/, 'no charter means no charter section')
+})

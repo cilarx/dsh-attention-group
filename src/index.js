@@ -231,7 +231,17 @@ function newGroup(title, options = {}) {
 function newMember(input) {
   return {
     id: String(input.id),
-    name: typeof input.name === 'string' && input.name.length > 0 ? input.name : String(input.id).slice(0, 12),
+    // ⚠️ No `slice(0, 12)` here any more. That fallback ran whenever the caller
+    // did not pass a name, and it TRUNCATED THE STORED NAME: a member invited as
+    // `Agent会话群聊专项DSH Agent` was written to the ledger as
+    // `Agent会话群聊专项D` (12 characters), so the panel could never show the real
+    // name and renaming it looked like a display bug. Measured 2026-10-17 against
+    // the user's own ledger.
+    //
+    // The fallback now keeps the WHOLE id. A long id is ugly but honest, and the
+    // panel — the only thing that has to fit it on a screen — wraps it. Data must
+    // not be shortened on the way in to make a view easier.
+    name: typeof input.name === 'string' && input.name.length > 0 ? input.name : String(input.id),
     kind: typeof input.kind === 'string' ? input.kind : 'session',
     joinedAt: new Date().toISOString(),
     subscribe: Array.isArray(input.subscribe) ? input.subscribe.filter((term) => typeof term === 'string') : [],

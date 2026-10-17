@@ -302,7 +302,7 @@ test('the settings tab exposes every knob the host declares', async () => {
   const panel = await openSettings()
   const shown = textOf(panel.tree)
 
-  for (const label of ['群名称', '唤醒', '推理强度', '路由模式', '自省', '群规', '拉人权限', '成员']) {
+  for (const label of ['群名称', '唤醒', '推理强度', '路由模式', '自省', '群用途及群规', '拉人权限', '成员']) {
     assert.match(shown, new RegExp(label), `settings must expose 「${label}」`)
   }
   for (const label of ['规则', '语义', '全体']) assert.match(shown, new RegExp(label), `route mode ${label}`)
@@ -377,7 +377,7 @@ test('renaming and editing the charter are writes, not decoration', async () => 
   assert.ok(charter !== undefined, 'the charter must be editable')
   assert.equal(charter.props.value, 'P群规：不谈Q群的事')
   next.change(charter, 'P群规：改了')
-  next.click(findButton(next.tree, '保存群规'))
+  next.click(findButton(next.tree, '保存群用途及群规'))
   assert.deepEqual(next.lastPost(), { action: 'charter', group: P_ID, charter: 'P群规：改了' })
 })
 
@@ -621,10 +621,12 @@ test('an existing liaison can be paused, told to wake, or removed', async () => 
 test('the effort control can be extended to live sessions, and says what that costs', async () => {
   const panel = await openSettings()
   const shown = textOf(panel.tree)
-  assert.ok(shown.includes('也改活会话'), 'U3 must be reachable from the panel')
-  assert.ok(shown.includes('这个部署支持改活会话'), 'and must say whether this deployment can do it')
+  // The label used to read 「也改活会话」, which is jargon: "活会话" is not a word a
+  // person uses. It now says what it does to whom. Reported by the user 2026-10-17.
+  assert.ok(shown.includes('立刻改正在运行的成员'), 'U3 must be reachable from the panel')
+  assert.ok(shown.includes('这个部署支持直接改正在运行的会话'), 'and must say whether this deployment can do it')
 
-  panel.click(findButton(panel.tree, '也改活会话'))
+  panel.click(findButton(panel.tree, '立刻改正在运行的成员'))
   assert.deepEqual(panel.lastPost(), { action: 'effort', group: P_ID, liveEffort: true })
   await panel.settle()
 })

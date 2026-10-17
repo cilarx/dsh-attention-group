@@ -454,7 +454,7 @@ test('C-04 the deployment-default side effect is in the VISIBLE text, not only t
   const panel = await openSettings()
   const shown = textOf(panel.tree)
   assert.match(shown, /部署默认模型/u, 'the side effect changes the deployment, so the screen must say it')
-  assert.match(findButton(panel.tree, '也改活会话').props.title, /部署默认模型/u)
+  assert.match(findButton(panel.tree, '立刻改正在运行的成员').props.title, /部署默认模型/u)
 })
 
 test('C-04 a room already on live effort says what that currently means', async () => {
@@ -487,7 +487,7 @@ test('C-05 a live-effort switch that changed nothing says why', async () => {
     post: (body) => (body.action === 'effort' ? { liveApplied: false, applied: 0, skipped: 0, liveReason: 'no sessionController in this deployment' } : {}),
   })
   await openSettings(panel)
-  panel.click(findButton(panel.tree, '也改活会话'))
+  panel.click(findButton(panel.tree, '立刻改正在运行的成员'))
   await panel.settle()
   const shown = textOf(panel.tree)
   assert.match(shown, /活会话一个也没改/u, 'a switch that shows 「开」 while nothing changed is the bug')
@@ -498,7 +498,7 @@ test('C-05 a live-effort switch that changed nothing says why', async () => {
 test('C-05 turning it on with no effort set says there was nothing to apply', async () => {
   const panel = await mount({ post: (body) => (body.action === 'effort' ? { liveApplied: true, applied: 0, skipped: 0 } : {}) })
   await openSettings(panel)
-  panel.click(findButton(panel.tree, '也改活会话'))
+  panel.click(findButton(panel.tree, '立刻改正在运行的成员'))
   await panel.settle()
   assert.match(textOf(panel.tree), /没有活会话需要改/u)
 })
@@ -506,7 +506,7 @@ test('C-05 turning it on with no effort set says there was nothing to apply', as
 test('C-05 a host that reports nothing at all is admitted, not papered over', async () => {
   const panel = await mount({ post: (body) => (body.action === 'effort' ? { liveEffort: true, effortStatus: 'available' } : {}) })
   await openSettings(panel)
-  panel.click(findButton(panel.tree, '也改活会话'))
+  panel.click(findButton(panel.tree, '立刻改正在运行的成员'))
   await panel.settle()
   assert.match(textOf(panel.tree), /宿主没有报告活会话的改动结果/u)
 })
