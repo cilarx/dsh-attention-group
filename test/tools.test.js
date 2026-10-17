@@ -782,3 +782,43 @@ test('the ledger round-trips through disk unchanged', () => {
   const back = readLedger(root)
   assert.deepEqual(back.ledger, JSON.parse(JSON.stringify(ledger)))
 })
+
+test('B-06: a stale save merges rooms created by another process instead of erasing them', () => {
+  // Adversarial audit B-06 (2026-10-16). The ledger lives in memory for the life
+  // of the process, so a second DSH writing `groups.json` is invisible to the
+  // first — and the first process's next save would silently erase whatever the
+  // second had created. Two DSH instances on one data directory is the only way to
+  // hit it, but "silently erased" is the worst possible answer to it.
+  const root = join(dataHome, 'attention-group')
+  mkdirSync(root, { recursive: true })
+
+  const mine = emptyLedger()
+  mine.groups.push({ id: 'mine', title: 'Mine', members: [] })
+  writeLedger(root, mine)
+
+  // Another process creates a room; we never see it, because our copy is in memory.
+  const theirs = readLedger(root).ledger
+  theirs.groups.push({ id: 'theirs', title: 'Theirs', members: [] })
+  writeLedger(root, theirs)
+
+  // Saving our stale copy must keep the room we know nothing about.
+  writeLedger(root, mine)
+  const ids = readLedger(root).ledger.groups.map((group) => group.id).sort()
+  assert.deepEqual(ids, ['mine', 'theirs'], `a room written by another process must survive, got ${ids.join(', ')}`)
+})
+
+test('A-10: a period that is not a date is refused, not answered as "no messages"', async () => {
+  // Adversarial audit A-10 (2026-10-16): `since: "not-a-date"` was accepted and
+  // compared as text, which matches nothing — so the caller was told "there is
+  // nothing in that period" about a period it never managed to describe.
+  const { tools } = fakeContext()
+  const created = await callTool(tools, 'attention_group_create', { title: 'range room' }, agentA)
+
+  const bad = await callTool(tools, 'attention_digest', { groupId: created.groupId, since: 'not-a-date' }, agentA)
+  assert.equal(bad.ok, false, 'an unparseable instant must be refused')
+  assert.match(bad.error, /not a date/)
+
+  // A real ISO instant still works, so the guard is not refusing valid input.
+  const good = await callTool(tools, 'attention_digest', { groupId: created.groupId, since: '2026-10-16T00:00:00.000Z' }, agentA)
+  assert.equal(good.ok, true)
+})

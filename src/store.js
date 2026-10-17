@@ -33,7 +33,10 @@ export function resolveDataRoot(env = process.env) {
 
 /** An empty ledger. */
 export function emptyLedger() {
-  return { version: LEDGER_VERSION, groups: [] }
+  // `revision` is a monotonic counter, and it exists for one reason: to notice
+  // that ANOTHER PROCESS wrote the ledger since this one read it. See
+  // `writeLedger`.
+  return { version: LEDGER_VERSION, revision: 0, groups: [] }
 }
 
 /** A one-line reason from a thrown value, never the string "undefined". */
@@ -131,7 +134,8 @@ export function readLedger(root) {
       groups.push(group)
       if (problems.length > 0) repairs.push({ id: group.id, problems })
     }
-    return { ledger: { version: LEDGER_VERSION, groups }, ...(repairs.length === 0 ? {} : { repairs }) }
+    const revision = typeof parsed.revision === 'number' && Number.isFinite(parsed.revision) && parsed.revision >= 0 ? Math.floor(parsed.revision) : 0
+    return { ledger: { version: LEDGER_VERSION, revision, groups }, ...(repairs.length === 0 ? {} : { repairs }) }
   } catch {
     const aside = `${file}.corrupt-${Date.now()}`
     try { renameSync(file, aside) } catch { /* keep booting regardless */ }
@@ -150,14 +154,48 @@ export function readLedger(root) {
  * (2026-10-16) noticed the module comment promised fsync and the code did not
  * do it.
  *
+ * ⚠️ TWO PROCESSES, ONE DATA DIRECTORY. This plugin keeps the ledger in memory
+ * for the life of the process, so a second DSH writing `groups.json` is invisible
+ * to the first — and the next save from the first would silently erase whatever
+ * the second had written. That is the failure audit B-06 named.
+ *
+ * The fix here is a best-effort MERGE, not a lock: every write re-reads what is
+ * actually on disk first, and any room this process does not know about is kept.
+ * Inside a room the last writer still wins, which is the honest limit of a merge
+ * this cheap; the alternative (a cross-process lock plus per-mutation rebase) is
+ * a database, and this plugin's whole point is not being one. Each individual
+ * write is already atomic because of the temp-file rename, so the window this
+ * leaves is microseconds wide and it cannot produce a corrupt file — only a
+ * last-write-wins on one room.
+ *
  * @param {string} root - data root.
- * @param {object} ledger - full ledger value.
+ * @param {object} ledger - full ledger value; its `revision` is advanced in place.
  */
 export function writeLedger(root, ledger) {
   mkdirSync(root, { recursive: true })
   const file = join(root, 'groups.json')
   const temp = `${file}.tmp-${process.pid}`
-  const text = `${JSON.stringify(ledger, null, 2)}\n`
+
+  const ours = typeof ledger.revision === 'number' ? ledger.revision : 0
+  const onDisk = readLedger(root)
+  const theirs = typeof onDisk.ledger.revision === 'number' ? onDisk.ledger.revision : 0
+  if (theirs !== ours) {
+    // Another process wrote since we read. Keep the rooms it created; we do not
+    // know about them, so dropping them would be data loss.
+    const known = new Set((Array.isArray(ledger.groups) ? ledger.groups : []).map((group) => group?.id))
+    let adopted = 0
+    for (const group of Array.isArray(onDisk.ledger.groups) ? onDisk.ledger.groups : []) {
+      if (known.has(group?.id)) continue
+      ledger.groups.push(group)
+      adopted += 1
+    }
+    console.warn(
+      `${'dsh-attention-group'}: groups.json was written by another process (revision ${theirs} vs ${ours}); merged ${adopted} room(s) created elsewhere instead of erasing them`,
+    )
+  }
+
+  const next = { version: LEDGER_VERSION, revision: Math.max(ours, theirs) + 1, groups: Array.isArray(ledger.groups) ? ledger.groups : [] }
+  const text = `${JSON.stringify(next, null, 2)}\n`
   const fd = openSync(temp, 'w')
   try {
     writeSync(fd, text)
@@ -170,6 +208,9 @@ export function writeLedger(root, ledger) {
     closeSync(fd)
   }
   renameSync(temp, file)
+  // Keep the in-memory copy's counter in step, or the very next save would see a
+  // mismatch against itself and re-merge its own rooms.
+  ledger.revision = next.revision
 }
 
 /** Directory holding one JSONL transcript per group. */

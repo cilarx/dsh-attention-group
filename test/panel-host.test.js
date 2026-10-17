@@ -363,3 +363,19 @@ test('a room recorded before joinPolicy existed stays at the default, not open',
   )
   assert.equal(out.ok, false, 'a legacy room must not silently become public')
 })
+
+test('A-12: a request body larger than the cap is refused with 413 instead of being buffered', async () => {
+  // Adversarial audit A-12 (2026-10-16): a 16 MiB body was accepted, parsed and
+  // answered with status 200 in 192 ms — nothing refused it. The panel never sends
+  // more than a few kilobytes (a charter, one message), so a megabyte cap costs
+  // nothing and refusing early is far cheaper than parsing.
+  boot()
+  await newRoom('big-body room')
+  const huge = await call({ method: 'POST', body: { action: 'create', title: 'x'.repeat(2 * 1024 * 1024) } })
+  assert.equal(huge.status, 413, `a 2 MiB body must be refused, got ${huge.status}`)
+  assert.match(String(huge.json?.error ?? ''), /rejected|limit/i)
+
+  // The cap must not break ordinary use — the next request still works.
+  const normal = await call({ method: 'POST', body: { action: 'create', title: 'after the cap' } })
+  assert.equal(normal.status, 200, 'a normal body must still be accepted')
+})

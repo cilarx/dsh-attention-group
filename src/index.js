@@ -2162,7 +2162,16 @@ function registerTools(ctx, state) {
         } catch (error) {
           return { ok: false, error: errorMessage(error) }
         }
-        const { since, until } = resolveRange({ range: args.range, since: args.since, until: args.until })
+        const { since, until, invalid } = resolveRange({ range: args.range, since: args.since, until: args.until })
+        // A period that could not be understood must be an error, not an empty
+        // answer. "Nothing in that range" for a range nobody actually described is
+        // a lie the caller cannot detect — adversarial audit A-10 (2026-10-16).
+        if (invalid !== undefined) {
+          return {
+            ok: false,
+            error: `${invalid} is not a date; pass an ISO-8601 instant (for example 2026-10-16T00:00:00.000Z) or use range "today" / "24h"`,
+          }
+        }
         const all = readMessages(state.root, group.id, { limit: 0 }).filter((row) => inRange(row, since, until))
         // The digest is a tool result, so it is bounded by construction: one line
         // per message plus a fixed header, and the cap leaves room for the header.
@@ -2228,7 +2237,16 @@ function registerTools(ctx, state) {
         } catch (error) {
           return { ok: false, error: errorMessage(error) }
         }
-        const { since, until } = resolveRange({ range: args.range, since: args.since, until: args.until })
+        const { since, until, invalid } = resolveRange({ range: args.range, since: args.since, until: args.until })
+        // A period that could not be understood must be an error, not an empty
+        // answer. "Nothing in that range" for a range nobody actually described is
+        // a lie the caller cannot detect — adversarial audit A-10 (2026-10-16).
+        if (invalid !== undefined) {
+          return {
+            ok: false,
+            error: `${invalid} is not a date; pass an ISO-8601 instant (for example 2026-10-16T00:00:00.000Z) or use range "today" / "24h"`,
+          }
+        }
         const all = readMessages(state.root, group.id, { limit: 0 }).filter((row) => inRange(row, since, until))
 
         // Who writes it. An explicit id wins; otherwise the room's own built-in
@@ -2603,12 +2621,33 @@ function registerPanelRoute(webServer, state) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
     res.end(JSON.stringify(value))
   }
+  // ⚠️ A request body needs a ceiling. Without one this handler would happily
+  // buffer 16 MiB and then try to parse it as JSON — measured by adversarial
+  // audit A-12 (2026-10-16): status 200, 192 ms, nothing refused. The panel never
+  // sends more than a few kilobytes (a charter, a message), so a megabyte is
+  // already generous, and refusing early is cheaper than parsing.
+  const MAX_BODY_BYTES = 1024 * 1024
   const readBody = (req) =>
-    new Promise((resolve) => {
+    new Promise((resolve, reject) => {
       const chunks = []
-      req.on('data', (chunk) => chunks.push(chunk))
-      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-      req.on('error', () => resolve(''))
+      let bytes = 0
+      let overflow = false
+      req.on('data', (chunk) => {
+        if (overflow) return
+        bytes += chunk.length
+        if (bytes > MAX_BODY_BYTES) {
+          overflow = true
+          reject(new Error(`${bytes} bytes exceeds the ${MAX_BODY_BYTES}-byte limit`))
+          return
+        }
+        chunks.push(chunk)
+      })
+      req.on('end', () => {
+        if (!overflow) resolve(Buffer.concat(chunks).toString('utf8'))
+      })
+      req.on('error', () => {
+        if (!overflow) resolve('')
+      })
     })
 
   try {
@@ -2627,7 +2666,15 @@ function registerPanelRoute(webServer, state) {
           }
 
           if (req.method === 'POST') {
-            const raw = await readBody(req)
+            let raw
+            try {
+              raw = await readBody(req)
+            } catch (error) {
+              // 413, not 500: the request was too big, and saying so lets the
+              // caller fix it instead of retrying the same body.
+              sendJson(res, 413, { ok: false, error: `request body rejected: ${errorMessage(error)}` })
+              return
+            }
             let body
             try {
               body = JSON.parse(raw)
@@ -3063,7 +3110,14 @@ async function applyPanelAction(state, body) {
   if (action === 'digest') {
     // R9's free half: a human asking "what did this room talk about today" gets
     // an answer without any model being involved, and without anybody waking up.
-    const { since, until } = resolveRange({ range: body?.range })
+    const { since, until, invalid } = resolveRange({
+      range: body?.range,
+      since: typeof body?.since === 'string' ? body.since : undefined,
+      until: typeof body?.until === 'string' ? body.until : undefined,
+    })
+    if (invalid !== undefined) {
+      return { ok: false, error: `${invalid} is not a date; pass an ISO-8601 instant (for example 2026-10-16T00:00:00.000Z)` }
+    }
     const rows = readMessages(state.root, group.id, { limit: 0 }).filter((row) => inRange(row, since, until))
     const digest = buildDigest({ group, messages: rows, since, until, limit: 200 })
     return done({

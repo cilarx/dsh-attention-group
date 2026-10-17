@@ -27,8 +27,12 @@ export const REASON = {
   keyword: 'keyword',
   /** No rule matched, but the group is configured to wake everyone anyway. */
   broadcast: 'broadcast',
-  /** No rule matched, but this member is the group's built-in administrator. */
-  admin: 'admin',
+  // NOTE: there used to be an `admin: 'admin'` reason here, documented as "no rule
+  // matched, but this member is the group's built-in administrator". Nothing ever
+  // produced it — an admin is woken by `mention`, by a keyword, or by `summary`,
+  // never by an admin-specific rule, because the router has no such rule. A dead
+  // enum is worse than no enum: it reads as a capability. Found by adversarial
+  // audit B-13 (2026-10-16).
   /**
    * R9: this member was explicitly asked to summarise a time range. Not produced
    * by the router — it is a direct assignment, so it bypasses relevance matching

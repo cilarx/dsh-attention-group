@@ -58,12 +58,27 @@ export function lastDayRange(now = new Date()) {
  * timestamp to work. Explicit `since`/`until` always win over the word.
  *
  * @param {object} input - `{range, since, until, now}`.
- * @returns {{since: string, until: string}} ISO instants; `''` means unbounded.
+ * @returns {{since: string, until: string, invalid?: string}} ISO instants; `''`
+ *   means unbounded, and `invalid` names the field that was not a date at all.
  */
 export function resolveRange({ range, since, until, now } = {}) {
   const at = now === undefined ? new Date() : now
-  const explicitSince = typeof since === 'string' ? since : ''
-  const explicitUntil = typeof until === 'string' ? until : ''
+  const explicitSince = typeof since === 'string' ? since.trim() : ''
+  const explicitUntil = typeof until === 'string' ? until.trim() : ''
+
+  // ⚠️ A value that is not a date used to be accepted silently and then compared
+  // as text — which produces a range that matches nothing. The caller was told
+  // "there is nothing in that period" about a period it never managed to
+  // describe, and had no way to find out. Adversarial audit A-10 (2026-10-16).
+  // An unparseable instant is refused, not obeyed.
+  const invalid = [
+    ['since', explicitSince],
+    ['until', explicitUntil],
+  ]
+    .filter(([, value]) => value.length > 0 && Number.isNaN(new Date(value).getTime()))
+    .map(([name]) => name)
+  if (invalid.length > 0) return { since: explicitSince, until: explicitUntil, invalid: invalid.join(' and ') }
+
   if (explicitSince.length > 0 || explicitUntil.length > 0) return { since: explicitSince, until: explicitUntil }
   if (range === 'today') return localDayRange(at)
   if (range === '24h') return lastDayRange(at)

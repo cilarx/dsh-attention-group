@@ -239,3 +239,13 @@ test('the CJK prefix bug cannot wake anyone through the router', () => {
   assert.equal(plan.recipients.length, 1, `exactly one member may be woken, got ${plan.recipients.length}`)
   assert.equal(plan.recipients[0].memberId, 's-mingming')
 })
+
+test('B-13: there is no admin wake reason, because nothing ever produces one', () => {
+  // Adversarial audit B-13 (2026-10-16). The enum carried `admin: 'admin'`,
+  // documented as "no rule matched, but this member is the group's built-in
+  // administrator". Nothing returned it: an admin is woken by `mention`, by a
+  // keyword, or by `summary`, never by an admin-specific rule the router does not
+  // have. A dead enum reads as a capability, which is worse than no enum at all.
+  assert.equal(Object.hasOwn(REASON, 'admin'), false, 'REASON.admin was dead code and must stay removed')
+  assert.equal(Object.hasOwn(REASON, 'summary'), true, 'summary IS produced, by attention_summarize')
+})
