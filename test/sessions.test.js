@@ -7,13 +7,14 @@
  * to another room, or an activity time invented from nothing would make choosing
  * by eye WORSE than copying an id, because the mistake is invisible.
  *
- * So the assertions are about the three things a person compares (title,
- * workspace, last activity), about the cost ceiling (titles are read for the rows
- * that will be shown, not for every session on the machine), and — the rule this
- * codebase keeps re-learning (c7) — about DEGRADATION BEING STATED: no
- * `sessionQuery`, no sessions directory, unreadable titles and a capped list each
- * have to say what they are, because the alternative is a list that looks complete
- * and is not.
+ * ⚠️ AND WHY THE STUBS MATTER MORE THAN USUAL: on 2026-10-17 this picker shipped a
+ * version whose titles were ALL missing in the user's live deployment, while
+ * every test here stayed green — because the test double had been written to
+ * match a signature the code believed rather than the one the running runtime
+ * actually has. The lesson is baked in below: the double now reproduces the LIVE
+ * contract (`sessionController.list()` → `projections.values.title`), and the
+ * projection cache is a TRAP that throws if the code ever reaches for it directly
+ * again.
  *
  * Run: node --test test/sessions.test.js
  * (requires: pwsh -File tools/sync-plugin.ps1)
@@ -62,22 +63,57 @@ function plantSession(home, bucket, id, at) {
 }
 
 /**
- * A `ctx` whose services serve a catalogue.
+ * A `ctx` matching the LIVE runtime's services.
  *
- * @param {object[]} catalog - `{id, title, cwd, createdAt, live, origin, agentPreset, isSeeded}`.
- * @param {object} [extra] - `{workspaces, listError, titleError, titleThrows, noProjectionCache}`.
+ * `sessionController.list()` is the primary source — the same call the Web GUI
+ * sidebar makes, whose `SessionSummary.projections.values.title` is the cached
+ * title. `sessionQuery.listSessions()` is the fallback for a deployment without a
+ * session controller (rows only, no titles).
+ *
+ * @param {object[]} catalog - `{id, title, cwd, updatedAt, createdAt, live, origin, isSeeded}`.
+ * @param {object} [extra] - `{workspaces, listError, noController, noQuery}`.
  * @returns {object} Cordis-context stand-in.
  */
 function fakeCtx(catalog, extra = {}) {
-  const asked = []
+  const calls = { cache: 0, titleSnapshots: 0, list: 0 }
   const ctx = {
-    // Every `sessionQuery.readTitleSnapshots` call is recorded so a test can prove
-    // the picker does NOT fold titles out of session logs: on this machine the 40
-    // most recent logs total 67 MB, and doing that to draw a picker would stall
-    // the GUI behind one click.
-    asked,
+    calls,
     get(name) {
-      if (name === 'sessionQuery') {
+      if (name === 'sessionProjectionCache') {
+        // TRAP: reaching for this means hand-rolling a version-specific signature
+        // again. See the file header.
+        return {
+          cachedSnapshot() {
+            calls.cache += 1
+            throw new Error('the picker must not call the projection cache directly')
+          },
+          cachedPredecessorTitle() {
+            calls.cache += 1
+            throw new Error('the picker must not call the projection cache directly')
+          },
+        }
+      }
+      if (name === 'sessionController' && extra.noController !== true) {
+        return {
+          async list() {
+            calls.list += 1
+            if (extra.listError !== undefined) throw new Error(extra.listError)
+            return catalog.map((row) => ({
+              sessionId: row.id,
+              updatedAt: row.updatedAt ?? 0,
+              running: row.live === true,
+              blank: false,
+              agentAvailable: row.live === true,
+              ...(row.origin === undefined ? {} : { origin: row.origin }),
+              ...(row.cwd === undefined ? {} : { cwd: row.cwd }),
+              ...(typeof row.title === 'string' && row.title.length > 0
+                ? { projections: { kind: 'cached', asOfSeq: 1, values: { title: row.title } } }
+                : {}),
+            }))
+          },
+        }
+      }
+      if (name === 'sessionQuery' && extra.noQuery !== true) {
         return {
           async listSessions() {
             if (extra.listError !== undefined) throw new Error(extra.listError)
@@ -89,54 +125,16 @@ function fakeCtx(catalog, extra = {}) {
                 isSeeded: row.isSeeded === true,
                 ...(row.cwd === undefined ? {} : { cwd: row.cwd }),
                 ...(row.origin === undefined ? {} : { origin: row.origin }),
-                ...(row.agentPreset === undefined ? {} : { agentPreset: row.agentPreset }),
               },
               live: row.live === true,
               persisted: true,
             }))
           },
-          async readTitleSnapshots(ids) {
-            asked.push([...ids])
+          async readTitleSnapshots() {
+            // Folding a title out of a full session log is the expensive path this
+            // module must never take (measured: 67 MB for the 40 newest logs).
+            calls.titleSnapshots += 1
             throw new Error('the picker must not fold titles out of session logs')
-          },
-        }
-      }
-      if (name === 'sessionProjectionCache') {
-        if (extra.noProjectionCache === true) return undefined
-        // ⚠️ These stubs mirror the AUTHORITATIVE signature, not the abridged one
-        // in the runtime's Service inspect catalog:
-        //   cachedSnapshot(meta, inheritedEventCount, keys?)
-        //   cachedPredecessorTitle(meta, inheritedEventCount)
-        // The real implementation THROWS when an unseeded session is asked with a
-        // non-zero cut, so the first version of the picker (which passed the keys
-        // array as the second argument) lost every title on a healthy deployment
-        // while every test here stayed green. The `assertCut` guard is what makes
-        // that mistake fail loudly instead of silently.
-        const assertCut = (meta, inheritedEventCount) => {
-          if (inheritedEventCount !== 0) {
-            throw new Error(
-              `unseeded projection-cache identity inherited event count must be 0 (got ${JSON.stringify(inheritedEventCount)})`,
-            )
-          }
-          assert.equal(typeof meta?.version, 'number', 'the cache identifies a lifecycle by the header version')
-        }
-        return {
-          cachedSnapshot(meta, inheritedEventCount, keys) {
-            assertCut(meta, inheritedEventCount)
-            if (keys !== undefined) assert.deepEqual(keys, ['title'], 'the picker asks the cache for the title only')
-            if (extra.titleError !== undefined) throw new Error(extra.titleError)
-            const row = catalog.find((candidate) => candidate.id === meta?.id)
-            if (row === undefined || typeof row.title !== 'string' || row.title.length === 0) return undefined
-            if (extra.titleThrows === true) throw new Error('cache record is corrupt')
-            return { asOfSeq: 1, values: { title: row.title } }
-          },
-          cachedPredecessorTitle(meta, inheritedEventCount) {
-            assertCut(meta, inheritedEventCount)
-            // Mirrors the shipped API's fallback: only a SEEDED (forked) header has
-            // no own checkpoint, so only it may borrow a predecessor's title.
-            const row = catalog.find((candidate) => candidate.id === meta?.id)
-            if (row === undefined || row.isSeeded !== true) return undefined
-            return { asOfSeq: -1, values: { title: `predecessor:${row?.title ?? ''}` } }
           },
         }
       }
@@ -164,6 +162,10 @@ function assertNear(actual, expected, label) {
   assert.ok(Math.abs(actual - expected) <= 2, `${label}: expected ~${expected}, got ${actual}`)
 }
 
+// ---------------------------------------------------------------------------
+// the log scan (fallback time source)
+// ---------------------------------------------------------------------------
+
 test('the log mtime of each session is found, across workspace buckets', () => {
   const home = newHome()
   const now = Date.now()
@@ -178,9 +180,8 @@ test('the log mtime of each session is found, across workspace buckets', () => {
 })
 
 test('a missing sessions directory is reported as unavailable, never as "no sessions"', () => {
-  // c7: this is the picker's version of 「读取失败渲染成空结果」. The list can still
-  // be served (sessions come from the runtime), but every row's time must then be
-  // absent — and the payload must say why.
+  // c7: the list can still be served (sessions come from the runtime), but every
+  // row's time must then be absent — and the payload must say why.
   const scanned = sessionLogTimes(newHome())
   assert.equal(scanned.scanned, false)
   assert.equal(typeof scanned.error, 'string')
@@ -215,23 +216,27 @@ test('the session log decides the time, not a bigger file beside it', () => {
   assertNear(scanned.times.get('session-aaaa'), now - 5 * HOUR, 'the log mtime must win')
 })
 
-test('candidates are ordered by last activity, then live, then creation', () => {
+// ---------------------------------------------------------------------------
+// ordering
+// ---------------------------------------------------------------------------
+
+test('candidates are ordered by last activity, then live, then id', () => {
   const ordered = sortSessionCandidates([
-    { id: 'stale', lastUsedMs: 1000, createdAt: 9 },
-    { id: 'fresh', lastUsedMs: 9000, createdAt: 1 },
-    { id: 'never-used-but-live', lastUsedMs: undefined, live: true, createdAt: 2 },
-    { id: 'never-used', lastUsedMs: undefined, createdAt: 5 },
+    { id: 'stale', lastUsedMs: 1000 },
+    { id: 'fresh', lastUsedMs: 9000 },
+    { id: 'never-used-but-live', lastUsedMs: undefined, live: true },
+    { id: 'never-used', lastUsedMs: undefined },
   ])
   assert.deepEqual(
     ordered.map((row) => row.id),
     ['fresh', 'stale', 'never-used-but-live', 'never-used'],
     'a session with a time always beats one without; among equals the live one wins',
   )
-  // Two sessions created in the same millisecond must not swap places between
-  // renders: the tie-break is deterministic.
+  // Two sessions with the same activity must not swap places between renders:
+  // the tie-break is deterministic.
   const a = sortSessionCandidates([
-    { id: 'zzz', lastUsedMs: 1, createdAt: 1 },
-    { id: 'aaa', lastUsedMs: 1, createdAt: 1 },
+    { id: 'zzz', lastUsedMs: 1 },
+    { id: 'aaa', lastUsedMs: 1 },
   ])
   assert.deepEqual(
     a.map((row) => row.id),
@@ -239,15 +244,19 @@ test('candidates are ordered by last activity, then live, then creation', () => 
   )
 })
 
-test('no sessionQuery service is an explained refusal, not an empty list', async () => {
+// ---------------------------------------------------------------------------
+// the live path: sessionController.list()
+// ---------------------------------------------------------------------------
+
+test('no session service at all is an explained refusal, not an empty list', async () => {
   const payload = await listSessionCandidates({ ctx: { get: () => undefined }, dshHome: newHome() })
   assert.equal(payload.ok, false)
-  assert.match(payload.error, /sessionQuery/u)
+  assert.match(payload.error, /sessionController/u)
   assert.match(payload.error, /paste a session id/iu)
   assert.equal(payload.sessions, undefined, 'a refusal must not also carry an empty list')
 })
 
-test('listSessions throwing is reported with the host reason', async () => {
+test('a throwing session list is reported with the host reason', async () => {
   const payload = await listSessionCandidates({
     ctx: fakeCtx([], { listError: 'persistence unavailable' }),
     dshHome: newHome(),
@@ -259,11 +268,13 @@ test('listSessions throwing is reported with the host reason', async () => {
 test('each row carries title, workspace, cwd and last activity', async () => {
   const home = newHome()
   const now = Date.now()
-  plantSession(home, '--J-work--', 'session-aaaa', now - 2 * HOUR)
+  // A log on disk whose mtime DISAGREES with the runtime's figure: the runtime's
+  // updatedAt must win, because that is the number the sidebar orders by.
+  plantSession(home, '--J-work--', 'session-aaaa', now - 9 * HOUR)
   const ctx = fakeCtx(
     [
-      { id: 'session-aaaa', title: '插件工程协调', cwd: 'J:\\work', createdAt: 1, agentPreset: 'default' },
-      { id: 'session-bbbb', title: '测试群', cwd: 'C:\\Users\\yanmenjiao\\.dsh\\bot-workspace', createdAt: 2 },
+      { id: 'session-aaaa', title: '插件工程协调', cwd: 'J:\\work', updatedAt: now - 2 * HOUR, live: true },
+      { id: 'session-bbbb', title: '测试群', cwd: 'C:\\Users\\yanmenjiao\\.dsh\\bot-workspace', updatedAt: now - 30 * HOUR },
     ],
     {
       workspaces: [
@@ -278,120 +289,94 @@ test('each row carries title, workspace, cwd and last activity', async () => {
   assert.equal(payload.shown, 2)
   assert.equal(payload.workspacesStatus, 'ok')
   assert.equal(payload.titlesStatus, 'ok')
-  assert.equal(payload.timeSource, 'session-log-mtime')
+  assert.equal(payload.untitled, 0)
+  assert.equal(payload.timeSource, 'session-controller.updatedAt')
 
   const first = payload.sessions[0]
-  assert.equal(first.id, 'session-aaaa', 'the session with a real activity time sorts first')
+  assert.equal(first.id, 'session-aaaa', 'the session with the newest activity sorts first')
   assert.equal(first.title, '插件工程协调')
   assert.equal(first.workspace, 'DSH默认')
   assert.equal(first.cwd, 'J:\\work')
-  assertNear(Date.parse(first.lastUsedAt), now - 2 * HOUR, 'lastUsedAt')
-  assert.equal(first.live, false)
+  assert.equal(first.lastUsedAt, new Date(now - 2 * HOUR).toISOString(), "the runtime's updatedAt wins over the log mtime")
+  assert.equal(first.live, true)
   assert.equal(first.subagent, false)
-  assert.equal(first.preset, 'default')
 
   const second = payload.sessions[1]
   assert.equal(second.workspace, 'DS Bot', 'a workspace is matched by its session account as well as by path')
-  assert.equal(second.lastUsedAt, '', 'a session with no log on disk has NO time, not a fake one')
   // Room membership is the caller's business (index.js marks it), so the
   // catalogue must not pretend to know it.
   assert.equal('member' in first, false)
 })
 
-test('a session with no title is reported as having none — never as its id in disguise', async () => {
-  const ctx = fakeCtx([{ id: 'session-cccc', createdAt: 3 }])
+test('titles come from the runtime list only — no cache call, no log fold', async () => {
+  // This is the assertion that would have caught the 2026-10-17 regression: the
+  // picker must not reach into `sessionProjectionCache` (whose signature differs
+  // between DSH versions) and must not fold titles out of session logs (67 MB for
+  // the 40 newest). Both doubles throw if touched.
+  const ctx = fakeCtx([{ id: 'session-aaaa', title: '有标题', updatedAt: 5 }])
   const payload = await listSessionCandidates({ ctx, dshHome: newHome() })
-  assert.equal(payload.sessions[0].title, '')
-  assert.equal(payload.sessions[0].workspace, '')
-  assert.equal(payload.sessions[0].cwd, '')
-})
-
-test('titles come from the projection cache — no session log is ever folded', async () => {
-  // ⚠️ This is the assertion that keeps the picker from freezing the GUI. The
-  // obvious API is `sessionQuery.readTitleSnapshots`, which folds the title out of
-  // the session's COMPLETE event log. Measured on this machine 2026-10-17: the 40
-  // most recent logs total 67 MB (one is 11 MB), so forty titles that way would
-  // decompress and replay tens of megabytes on the host's main thread during one
-  // click. The stub below THROWS if the picker calls it at all.
-  const catalog = Array.from({ length: 12 }, (_, index) => ({
-    id: `session-${String(index).padStart(4, '0')}`,
-    title: `会话 ${index}`,
-    createdAt: 100 - index,
-  }))
-  const home = newHome()
-  const now = Date.now()
-  for (const row of catalog.slice(0, 5)) plantSession(home, '--J-work--', row.id, now - row.createdAt * 1000)
-  const ctx = fakeCtx(catalog)
-  const payload = await listSessionCandidates({ ctx, dshHome: home, max: 5 })
-  assert.equal(payload.shown, 5)
-  assert.equal(payload.total, 12, 'the total is the real one, so the panel can say what it is not showing')
-  assert.equal(payload.max, 5)
-  assert.deepEqual(ctx.asked, [], 'no session log may be folded to draw the picker')
-  assert.equal(payload.titlesStatus, 'ok')
-  assert.equal(payload.untitled, 0)
-  // And the titles that survive are the cached ones, not ids.
-  for (const row of payload.sessions) assert.match(row.title, /^会话 \d+$/u)
-})
-
-test('a title that needs a predecessor checkpoint still resolves, like the shipped API does', async () => {
-  // A seeded (forked) session has no own checkpoint, so the whole projection block
-  // is skipped and only a predecessor checkpoint's title may be used. The order is
-  // copied from `dsh-api-session-controller`, not invented here.
-  const ctx = fakeCtx([{ id: 'session-aaaa', title: '被分叉的会话', createdAt: 1, isSeeded: true }])
-  const payload = await listSessionCandidates({ ctx, dshHome: newHome() })
-  assert.equal(payload.sessions[0].title, 'predecessor:被分叉的会话')
-})
-
-test('the default ceiling is applied, and reported', async () => {
-  const catalog = Array.from({ length: MAX_CANDIDATES + 7 }, (_, index) => ({ id: `session-${index}`, createdAt: index }))
-  const payload = await listSessionCandidates({ ctx: fakeCtx(catalog), dshHome: newHome() })
-  assert.equal(payload.shown, MAX_CANDIDATES)
-  assert.equal(payload.total, MAX_CANDIDATES + 7)
-  assert.equal(payload.sessions.length, MAX_CANDIDATES)
-})
-
-test('a corrupt cache record costs one title, and the payload says how many', async () => {
-  const catalog = [
-    { id: 'session-aaaa', title: '有标题', createdAt: 2 },
-    { id: 'session-bbbb', title: '', createdAt: 1 },
-  ]
-  const payload = await listSessionCandidates({ ctx: fakeCtx(catalog), dshHome: newHome() })
   assert.equal(payload.ok, true)
-  assert.equal(payload.sessions.length, 2)
-  // A session that simply has no cached title yet is NOT a failure: nothing is
-  // broken, so the status stays ok and the count of untitled rows carries the fact.
+  assert.deepEqual(ctx.calls, { cache: 0, titleSnapshots: 0, list: 1 })
+  assert.equal(payload.sessions[0].title, '有标题')
+})
+
+test('a session with no title is reported as having none — never as its id in disguise', async () => {
+  const ctx = fakeCtx([
+    { id: 'session-aaaa', title: '有标题', updatedAt: 2 },
+    { id: 'session-bbbb', updatedAt: 1, origin: 'subagent' },
+  ])
+  const payload = await listSessionCandidates({ ctx, dshHome: newHome() })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.sessions[1].title, '')
+  assert.equal(payload.sessions[1].workspace, '')
+  assert.equal(payload.sessions[1].cwd, '')
+  assert.equal(payload.sessions[1].subagent, true)
+  // A session that simply has no cached title is NOT a failure: nothing is
+  // broken, so the status stays ok and the untitled count carries the fact.
   assert.equal(payload.titlesStatus, 'ok')
   assert.equal(payload.untitled, 1)
-
-  const partial = await listSessionCandidates({
-    ctx: fakeCtx(catalog, { titleThrows: true }),
-    dshHome: newHome(),
-  })
-  assert.equal(partial.ok, true, 'a title failure must not cost the list')
-  assert.match(
-    partial.titlesStatus,
-    /^partial: 1 of 2/u,
-    'the ONE corrupt record is counted as a read failure; the other row simply has no title yet',
-  )
-  assert.equal(partial.sessions.length, 2)
-  assert.equal(partial.untitled, 2)
-
-  const noCache = await listSessionCandidates({
-    ctx: fakeCtx(catalog, { noProjectionCache: true }),
-    dshHome: newHome(),
-  })
-  assert.equal(noCache.ok, true, 'a deployment without the cache still lists sessions')
-  assert.equal(noCache.sessions.length, 2)
-  assert.match(noCache.titlesStatus, /^unavailable: /u)
-  assert.match(noCache.titlesStatus, /sessionProjectionCache/u, 'and names the missing service')
-  assert.equal(noCache.sessions[0].title, '')
-  assert.equal(noCache.untitled, 2)
 })
 
-test('a malformed session record costs one row, and the count says so', async () => {
+test('an absurdly long cached title is bounded for display, and marked as cut', async () => {
+  const long = '长'.repeat(400)
+  const payload = await listSessionCandidates({
+    ctx: fakeCtx([{ id: 'session-aaaa', title: long, updatedAt: 1 }]),
+    dshHome: newHome(),
+  })
+  assert.equal(payload.sessions[0].title.length, 121, '120 characters plus the ellipsis')
+  assert.ok(payload.sessions[0].title.endsWith('…'))
+})
+
+test('a session with no activity time falls back to its log mtime, and says the source is mixed', async () => {
+  const home = newHome()
+  const now = Date.now()
+  plantSession(home, '--J-work--', 'session-bbbb', now - 3 * HOUR)
   const ctx = fakeCtx([
-    { id: 'session-aaaa', title: '好的', createdAt: 2 },
-    { id: '', title: '没有 id 的记录', createdAt: 1 },
+    { id: 'session-aaaa', title: '有时效', updatedAt: now - HOUR },
+    { id: 'session-bbbb', title: '只有日志', updatedAt: 0 },
+  ])
+  const payload = await listSessionCandidates({ ctx, dshHome: home })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.timeSource, 'mixed: sessionController.updatedAt + session-log-mtime')
+  const second = payload.sessions.find((row) => row.id === 'session-bbbb')
+  assertNear(Date.parse(second.lastUsedAt), now - 3 * HOUR, 'lastUsedAt from the log')
+})
+
+test('a session with no time anywhere is reported as unknown, not as a guess', async () => {
+  const payload = await listSessionCandidates({
+    ctx: fakeCtx([{ id: 'session-aaaa', title: '无时间', updatedAt: 0 }]),
+    dshHome: newHome(),
+  })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.timeSource, 'unavailable')
+  assert.equal(payload.sessions[0].lastUsedAt, '')
+  assert.equal(typeof payload.timeDetail, 'string', 'and the reason travels with it')
+})
+
+test('a malformed summary costs one row, and the count says so', async () => {
+  const ctx = fakeCtx([
+    { id: 'session-aaaa', title: '好的', updatedAt: 2 },
+    { id: '', title: '没有 id 的记录', updatedAt: 1 },
   ])
   const payload = await listSessionCandidates({ ctx, dshHome: newHome() })
   assert.equal(payload.ok, true)
@@ -399,12 +384,44 @@ test('a malformed session record costs one row, and the count says so', async ()
   assert.equal(payload.skipped, 1)
 })
 
+test('the default ceiling is applied, and the real total is reported', async () => {
+  const catalog = Array.from({ length: MAX_CANDIDATES + 7 }, (_, index) => ({ id: `session-${index}`, updatedAt: index }))
+  const payload = await listSessionCandidates({ ctx: fakeCtx(catalog), dshHome: newHome() })
+  assert.equal(payload.shown, MAX_CANDIDATES)
+  assert.equal(payload.total, MAX_CANDIDATES + 7)
+  assert.equal(payload.sessions.length, MAX_CANDIDATES)
+})
+
 test('a deployment without workspaceRegistry still labels the rows, from cwd', async () => {
   const payload = await listSessionCandidates({
-    ctx: fakeCtx([{ id: 'session-dddd', cwd: 'C:\\Users\\yanmenjiao\\.dsh\\bot-workspace', createdAt: 1 }]),
+    ctx: fakeCtx([{ id: 'session-dddd', cwd: 'C:\\Users\\yanmenjiao\\.dsh\\bot-workspace', updatedAt: 1 }]),
     dshHome: newHome(),
   })
   assert.equal(payload.workspacesStatus, 'unavailable')
   assert.equal(payload.sessions[0].workspace, '', 'the registry label is absent')
   assert.equal(payload.sessions[0].cwd, 'C:\\Users\\yanmenjiao\\.dsh\\bot-workspace', 'but the path still travels')
+})
+
+// ---------------------------------------------------------------------------
+// the fallback path: no sessionController in this composition
+// ---------------------------------------------------------------------------
+
+test('without a sessionController the rows still list, and the missing titles are stated', async () => {
+  const home = newHome()
+  const now = Date.now()
+  plantSession(home, '--J-work--', 'session-aaaa', now - 2 * HOUR)
+  const ctx = fakeCtx([{ id: 'session-aaaa', title: '运行时不能报标题', cwd: 'J:\\work', createdAt: now - 2 * HOUR }], {
+    noController: true,
+  })
+  const payload = await listSessionCandidates({ ctx, dshHome: home })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.sessions.length, 1)
+  assert.equal(payload.sessions[0].id, 'session-aaaa')
+  assert.equal(payload.sessions[0].title, '', 'no title is invented from the id')
+  assert.match(payload.titlesStatus, /^unavailable: /u)
+  assert.match(payload.titlesStatus, /sessionController/u, 'and the missing capability is named')
+  assert.equal(payload.untitled, 1)
+  assert.equal(payload.timeSource, 'session-log-mtime')
+  assertNear(Date.parse(payload.sessions[0].lastUsedAt), now - 2 * HOUR, 'the log supplies the time here')
+  assert.deepEqual(ctx.calls, { cache: 0, titleSnapshots: 0, list: 0 }, 'still no cache call and no log fold')
 })

@@ -594,10 +594,11 @@ test('the picker refuses with the missing capability named, never with an empty 
 })
 
 test('the picker lists sessions with title, workspace and last activity, and marks room members', async () => {
+  const ACTIVITY = Date.parse('2026-10-17T12:00:00.000Z')
   const catalog = [
-    { id: 'session-1111aaaa-1111-1111-1111-111111111111', title: '插件工程协调', cwd: 'J:\\work', createdAt: 30, live: true },
-    { id: 'session-2222bbbb-2222-2222-2222-222222222222', title: '测试群', cwd: 'C:\\Users\\test\\.dsh\\bot-workspace', createdAt: 20 },
-    { id: 'session-3333cccc-3333-3333-3333-333333333333', title: '', createdAt: 10, origin: 'subagent' },
+    { id: 'session-1111aaaa-1111-1111-1111-111111111111', title: '插件工程协调', cwd: 'J:\\work', updatedAt: ACTIVITY, live: true },
+    { id: 'session-2222bbbb-2222-2222-2222-222222222222', title: '测试群', cwd: 'C:\\Users\\test\\.dsh\\bot-workspace', updatedAt: ACTIVITY - 1000 },
+    { id: 'session-3333cccc-3333-3333-3333-333333333333', title: '', updatedAt: 0, origin: 'subagent' },
   ]
   // A SEPARATE deployment: this one has a session catalogue, and the shared host
   // deliberately has none (so every other test keeps covering the "absent service"
@@ -628,13 +629,14 @@ test('the picker lists sessions with title, workspace and last activity, and mar
     assert.equal(listed.json.sessions.length, 3)
     assert.equal(byId.get(catalog[0].id).title, '插件工程协调', 'the title the sidebar shows must travel')
     assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认', 'the workspace is the tie-breaker for similar titles')
-    assert.equal(byId.get(catalog[0].id).lastUsedAt, '2026-10-17T12:00:00.000Z', 'last activity comes from the session log')
+    assert.equal(byId.get(catalog[0].id).lastUsedAt, '2026-10-17T12:00:00.000Z', "last activity is the runtime's own updatedAt")
     assert.equal(byId.get(catalog[0].id).live, true)
     assert.equal(byId.get(catalog[0].id).member, false)
     assert.equal(byId.get(catalog[1].id).member, true, 'a session already in this room must say so')
     assert.equal(byId.get(catalog[2].id).title, '')
     assert.equal(byId.get(catalog[2].id).subagent, true)
-    assert.equal(byId.get(catalog[2].id).lastUsedAt, '', 'a session with no log has no time, not a guess')
+    assert.equal(byId.get(catalog[2].id).lastUsedAt, '', 'a session the runtime cannot date has no time, not a guess')
+    assert.equal(listed.json.timeSource, 'session-controller.updatedAt')
     assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认')
 
     // ⚠️ The list is cached (titles cost a log read per row), and membership is

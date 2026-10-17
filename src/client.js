@@ -853,7 +853,7 @@ window.__ModuleLoader__.load({
         titlesStatus: '',
         untitled: 0,
         timeSource: '',
-        timeError: '',
+        timeDetail: '',
         at: 0,
       })
       var [pendingRemove, setPendingRemove] = useState('')
@@ -1471,7 +1471,7 @@ window.__ModuleLoader__.load({
               titlesStatus: safeText(data.titlesStatus),
               untitled: countKnown(data.untitled) ? data.untitled : 0,
               timeSource: safeText(data.timeSource),
-              timeError: safeText(data.timeError),
+              timeDetail: safeText(data.timeDetail),
               at: Date.now(),
             })
           })
@@ -1548,8 +1548,10 @@ window.__ModuleLoader__.load({
           if (countKnown(candidates.shown) && countKnown(candidates.total) && candidates.total > candidates.shown) {
             notes.push('只显示最近 ' + candidates.shown + ' 个（这个部署共有 ' + candidates.total + ' 个会话）。')
           }
-          if (candidates.timeSource !== '' && candidates.timeSource !== 'session-log-mtime') {
-            notes.push('活动时间读不到：' + str(candidates.timeError, '宿主没有给出原因') + '。')
+          // Only when the host says it has NO source. A different source is not a
+          // problem worth a line; a missing one is.
+          if (candidates.timeSource === 'unavailable') {
+            notes.push('活动时间读不到：' + str(candidates.timeDetail, '宿主没有给出原因') + '。')
           }
           if (candidates.titlesStatus !== '' && candidates.titlesStatus !== 'ok') {
             notes.push('有会话的标题读不出来（宿主：' + candidates.titlesStatus + '）。')

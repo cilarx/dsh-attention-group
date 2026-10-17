@@ -432,16 +432,23 @@ a list that scrolls past forty rows is worse than typing an id. When it applies,
 「只显示最近 40 个（这个部署共有 N 个会话）」 instead of hiding the rest silently. The number is
 documented in the code comment and in both READMEs.
 
-> **Why the titles are not read out of the session logs.** Folding a title out of a session's
-> complete event log is what `sessionQuery.readTitleSnapshots` does, and measured on this machine
-> (2026-10-17) the 40 most recent logs total **67 MB** with a single log at 11 MB — one click
-> would decompress and replay tens of megabytes on the host's main thread and stall the whole
-> GUI. So titles come from DSH's **projection cache** (its own documentation calls this "the
-> zero-I/O listing read"; it is checkpointed at session creation, every `turn/end` and at
-> disposal), falling back to a predecessor checkpoint's title for a forked session. That order is
-> copied from DSH's own `dsh-api-session-controller`, not invented here. A session with no cached
-> title shows 「（无标题会话）」, and the panel says how many such rows there are — it never puts
-> an id where a title belongs.
+> **Where the rows and titles come from: one shipped API call, not a hand-rolled cache read.**
+> Both come from DSH's own `sessionController.list()` — the call the sidebar uses. It returns each
+> session's `updatedAt`, `running`, `cwd` and its **already-resolved cached title**
+> (`projections.values.title`) in one pass. That is not laziness: calling
+> `sessionProjectionCache.cachedSnapshot(...)` directly means hard-coding that method's EXACT
+> signature, and it differs between DSH versions — `cachedSnapshot(meta, keys?)` in the running
+> 0.2.1-rc.2, but `cachedSnapshot(meta, inheritedEventCount, keys?)` in the older 0.1.5-rc.1 tree
+> that still sits in `~/.dsh/profiles/node_modules`. Guessing the slots wrong does not fail
+> politely: it throws, **every title disappears, and every test stays green** — which is exactly
+> how this feature broke on a real machine on 2026-10-17. Delegating to the shipped list call puts
+> that signature with the code that owns it, so the picker does not have to track DSH versions. A
+> session with no cached title shows 「（无标题会话）」, and the panel says how many such rows there
+> are — it never puts an id where a title belongs.
+>
+> **Why not fold the title out of the session log:** doing that (`readTitleSnapshots`) means
+> decompressing and replaying tens of megabytes per click on this machine (the 40 newest logs total
+> 67 MB; one is 11 MB), stalling the whole GUI behind a single click.
 
 **The one click that can start a turn** is 「生成群史摘要」 (a direct request to the room's manager,
 never a scheduled job, and only while the room's 「唤醒」 switch is on). It reports what it actually
@@ -674,11 +681,14 @@ each title must match the projection cache **byte for byte**, no row may invent 
 activity time must come from a real log. No DSH running, no restart.
 
 Why it exists as a separate tool: a unit test can only prove the code matches the contract the
-test believes. On 2026-10-17 that gap almost shipped a silently dead feature — the runtime's
-Service inspect catalog shows `cachedSnapshot` as `(meta, keys?)` while the real signature is
-`(meta, inheritedEventCount, keys?)`, which **throws** for an unseeded session when the keys land
-in the wrong slot: every title disappears and every test stays green. This script is how that
-class of mistake gets caught before a restart.
+test believes. On 2026-10-17 this feature failed twice on the real machine, with every test green
+both times: first when the code called the projection cache with the signature from the STALE
+0.1.5 copy in `~/.dsh/profiles/node_modules` (every unseeded session threw, so every title
+vanished), then again when the "fix" was built against that same stale copy while the deployed
+0.2.1 has a different signature — and the doubles had been written to match the code's belief
+rather than the runtime. The version discipline this script bakes in: **read contracts from the
+DSH that is actually running** (`app.asar`, or the runtime's Inspect providers), never from the
+stale profile copy.
 
 The suites are layered on purpose:
 

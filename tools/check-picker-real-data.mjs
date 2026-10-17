@@ -1,33 +1,26 @@
 /**
  * The 「拉人」 picker against YOUR real data — no DSH restart needed.
  *
- * WHY THIS EXISTS. The picker's whole point is that a row can be recognised by
- * its title. Whether the titles are actually readable on a given machine has two
- * independent answers:
+ * WHY THIS EXISTS. The picker's whole point is that a row can be recognised by a
+ * title. Whether that works on a given machine cannot be answered by a unit test:
+ * a test can only prove the code matches the contract THE TEST BELIEVES. On
+ * 2026-10-17 exactly that gap shipped a picker whose titles were all missing in
+ * the live deployment while every test was green — twice, because the first
+ * "fix" was built against the wrong DSH version (see below).
  *
- *   1. does the code call the projection cache correctly, and
- *   2. does this machine's cache actually hold titles?
+ * WHAT IT DOES: it reads the real session directories, the real
+ * `session_projcache` records and the real workspace registry, re-implements
+ * `sessionController.list()` the way the RUNNING DSH does it — titles from each
+ * session's cached `title` projection, `updatedAt` from the cached
+ * `sessionListMetadata.lastPromptAt` — and then runs the plugin's own
+ * `listSessionCandidates()` over that. Finally it cross-checks every returned row
+ * against the cache file: a title may be absent only when the cache has none.
  *
- * Question 1 is unit-tested (`test/sessions.test.js`), but a unit test can only
- * prove the code matches the CONTRACT THE TEST BELIEVES. It cannot prove the
- * contract itself — and on 2026-10-17 that exact gap nearly shipped a broken
- * feature: the runtime's Service inspect catalog showed
- * `cachedSnapshot(meta, keys?)`, while the shipped implementation is
- * `cachedSnapshot(meta, inheritedEventCount, keys?)` and THROWS when an unseeded
- * session is passed the wrong cut. Every test was green; every title would have
- * been missing. Question 2 cannot be answered by any test at all.
- *
- * This script answers both, against the user's real files, without starting or
- * restarting DSH: it reads the real session directories, the real
- * `session_projcache` records and the real workspace registry, re-implements the
- * two DSH services as faithfully as their shipped source allows, and then runs
- * the plugin's own `listSessionCandidates()` over them.
- *
- * WHAT IT PROVES: the real titles come back (and match the cache byte for byte),
- * the real activity times come from the real logs, the workspace labels resolve.
- * WHAT IT DOES NOT PROVE: the live Cordis wiring (`ctx.get('…')` returning those
- * services). That needs a restarted DSH — but after this script passes, the only
- * remaining unknown is one property lookup.
+ * ⚠️ VERSION DISCIPLINE (the 2026-10-17 lesson, in full): the packages in
+ * `~/.dsh/profiles/node_modules/@deepseek-ai` are a STALE 0.1.5-rc.1 copy — the
+ * running 0.2.1-rc.2 host loads its own from `app.asar`. Contracts must be read
+ * from there (or from the runtime's Inspect providers), never from the profile
+ * tree. This script encodes the 0.2.1 shape, which is what this machine runs.
  *
  * READ-ONLY: nothing is written anywhere.
  *
@@ -65,93 +58,75 @@ for (const name of readdirSync(cacheDir)) {
     const parsed = JSON.parse(readFileSync(join(cacheDir, name), 'utf8'))
     if (parsed?.record !== undefined) cacheRecords.set(name.slice(0, -5), parsed.record)
   } catch {
-    // A broken record is exactly what the service also ignores; it will show up
-    // as an untitled row below, not as a crash.
+    // A broken record is exactly what the service also ignores; it shows up as an
+    // untitled row below, not as a crash.
   }
 }
 console.log(`\n== real data ==`)
 console.log(`  projection cache: ${cacheRecords.size} record(s)`)
 
-// ---------------------------------------------------------------------------
-// 2. a faithful stand-in for `sessionProjectionCache` (title unit only)
-//
-// Copied from the shipped implementation (`dsh-session-projection-cache`):
-// identityOf() and its throw, the identity comparison, and viewCheckpoint's
-// `row.ver !== stateVersion` filter for the `title` unit (stateVersion 1).
-// ---------------------------------------------------------------------------
-function identityOf(header, inheritedEventCount) {
-  const cut = Number(inheritedEventCount)
-  if (!header.isSeeded && cut !== 0) {
-    throw new Error('unseeded projection-cache identity inherited event count must be 0')
-  }
-  return {
-    formatVersion: header.version,
-    createdAt: header.createdAt,
-    ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
-    isSeeded: header.isSeeded,
-    inheritedEventCount: cut,
-  }
+/** The current `title` projection state-schema version (dsh-session-title). */
+const TITLE_UNIT_VERSION = 1
+/** The wire view of the title unit is the state itself, a string. */
+function cachedTitleOf(id) {
+  const row = cacheRecords.get(id)?.rows?.title
+  if (row === undefined || row.ver !== TITLE_UNIT_VERSION) return ''
+  return typeof row.val === 'string' ? row.val.trim() : ''
 }
-const sameScalar = (a, b) => (a === undefined ? b === undefined : String(a) === String(b))
-const sessionProjectionCache = {
-  cachedSnapshot(header, inheritedEventCount, keys) {
-    const expected = identityOf(header, inheritedEventCount)
-    const record = cacheRecords.get(header.id)
-    if (record === undefined) return undefined
-    const stored = record.identity
-    if (stored.formatVersion !== expected.formatVersion) return undefined
-    if (!sameScalar(stored.createdAt, expected.createdAt)) return undefined
-    if (!sameScalar(stored.cwd, expected.cwd)) return undefined
-    if (stored.isSeeded !== expected.isSeeded) return undefined
-    if (Number(stored.inheritedEventCount ?? 0) !== expected.inheritedEventCount) return undefined
-    const row = record.rows?.title
-    if (row === undefined || row.ver !== 1) return undefined
-    if (keys !== undefined && !keys.includes('title')) return undefined
-    if (typeof row.val !== 'string' || row.val.trim().length === 0) return undefined
-    return { asOfSeq: row.seq, values: { title: row.val } }
-  },
-  cachedPredecessorTitle(header, inheritedEventCount) {
-    identityOf(header, inheritedEventCount) // the real one validates the same way
-    return undefined // these checkpoints are current, not predecessors
-  },
+/** `updatedAt` = max(createdAt, sessionListMetadata.lastPromptAt). */
+function updatedAtOf(id, createdAt) {
+  const metadata = cacheRecords.get(id)?.rows?.sessionListMetadata
+  let lastPromptAt = 0
+  if (metadata !== undefined && metadata.ver === 1 && metadata.val !== null && typeof metadata.val === 'object') {
+    lastPromptAt = Number.isFinite(metadata.val.lastPromptAt) ? metadata.val.lastPromptAt : 0
+  }
+  return Math.max(Number.isFinite(createdAt) ? createdAt : 0, lastPromptAt)
 }
 
 // ---------------------------------------------------------------------------
-// 3. a faithful stand-in for `sessionQuery.listSessions()`
+// 2. a faithful stand-in for `sessionController.list()` on 0.2.1-rc.2
 //
-// The real one lists the session directories and returns each stored header. A
-// header carries (version, id, createdAt, cwd, isSeeded, …); the cache's identity
-// block is exactly those fields, which is why it can stand in for them here.
+//   list() = sessionQuery.listSessions() → live ? summarizeLive : (cold with a
+//   cwd ? summarizeCold : dropped) → sorted by updatedAt.
+//   summarizeCold returns {sessionId, updatedAt, running:false, blank, cwd?,
+//   origin?, projections?} where projections is the cached block (title).
 // ---------------------------------------------------------------------------
 const sessionsRoot = join(home, 'sessions')
-const records = []
-const seededIds = new Set()
+const summaries = []
+let omittedNoCwd = 0
 if (existsSync(sessionsRoot)) {
   for (const bucket of readdirSync(sessionsRoot, { withFileTypes: true })) {
-    if (!bucket.isDirectory()) continue
+    if (bucket.isDirectory() !== true) continue
     for (const entry of readdirSync(join(sessionsRoot, bucket.name), { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue
+      if (entry.isDirectory() !== true) continue
       const identity = cacheRecords.get(entry.name)?.identity
-      if (identity?.isSeeded === true) seededIds.add(entry.name)
-      records.push({
-        header: {
-          version: identity?.formatVersion ?? 4,
-          id: entry.name,
-          createdAt: identity?.createdAt ?? 0,
-          ...(identity?.cwd === undefined ? {} : { cwd: identity.cwd }),
-          isSeeded: identity?.isSeeded === true,
-        },
-        live: false,
-        persisted: true,
+      const createdAt = identity?.createdAt ?? 0
+      const cwd = identity?.cwd
+      if (cwd === undefined) {
+        // The shipped `list()` drops cold sessions without a cwd.
+        omittedNoCwd += 1
+        continue
+      }
+      const title = cachedTitleOf(entry.name)
+      summaries.push({
+        sessionId: entry.name,
+        updatedAt: updatedAtOf(entry.name, createdAt),
+        running: false,
+        blank: false,
+        agentAvailable: false,
+        cwd,
+        ...(title.length === 0 ? {} : { projections: { kind: 'cached', asOfSeq: 1, values: { title } } }),
       })
     }
   }
 }
-console.log(`  session dirs:     ${records.length}`)
-console.log(`  forked sessions:  ${seededIds.size}`)
+summaries.sort((left, right) => right.updatedAt - left.updatedAt)
+console.log(`  session dirs:      ${summaries.length + omittedNoCwd}`)
+console.log(`  omitted (no cwd):  ${omittedNoCwd}`)
+console.log(`  with a cached title: ${summaries.filter((row) => row.projections !== undefined).length}`)
 
 // ---------------------------------------------------------------------------
-// 4. the real workspace registry
+// 3. the real workspace registry
 // ---------------------------------------------------------------------------
 const workspaceFile = join(home, 'storages', 'workspace.json')
 const workspaces = []
@@ -161,19 +136,21 @@ if (existsSync(workspaceFile)) {
     workspaces.push({ id, title: row.title, path: row.path, sessionIds: Array.isArray(row.sessionIds) ? row.sessionIds : [] })
   }
 }
-console.log(`  workspaces:       ${workspaces.length}`)
+console.log(`  workspaces:        ${workspaces.length}`)
 
 const ctx = {
   get(name) {
-    if (name === 'sessionQuery') return { async listSessions() { return records } }
-    if (name === 'sessionProjectionCache') return sessionProjectionCache
+    if (name === 'sessionController') return { async list() { return summaries } }
     if (name === 'workspaceRegistry') return { list: () => workspaces }
+    if (name === 'sessionProjectionCache') {
+      throw new Error('the picker must not touch the projection cache directly')
+    }
     return undefined
   },
 }
 
 // ---------------------------------------------------------------------------
-// 5. run the plugin's own function over the real data
+// 4. run the plugin's own function over the real data
 // ---------------------------------------------------------------------------
 console.log(`\n== the picker's own code on that data ==`)
 const started = performance.now()
@@ -187,7 +164,9 @@ if (payload.ok !== true) {
   ok(`titlesStatus "${payload.titlesStatus}"`)
   ok(`timeSource "${payload.timeSource}"`)
   if (payload.titlesStatus !== 'ok') fail(`the titles are not fully readable: ${payload.titlesStatus}`)
-  if (payload.timeSource !== 'session-log-mtime') fail(`the activity times are missing: ${payload.timeError ?? 'no reason given'}`)
+  if (!payload.timeSource.startsWith('session-controller') && payload.timeSource !== 'mixed: sessionController.updatedAt + session-log-mtime') {
+    fail(`the activity times did not come from the runtime's own figure: ${payload.timeSource}`)
+  }
 
   console.log('\n  the rows the picker would draw:')
   for (const row of payload.sessions.slice(0, 12)) {
@@ -199,20 +178,15 @@ if (payload.ok !== true) {
   }
 
   // -------------------------------------------------------------------------
-  // 6. cross-check EVERY row against the real cache record
+  // 5. cross-check EVERY row against the real cache record
   // -------------------------------------------------------------------------
   let matched = 0
   let invented = 0
   let shouldHaveTitle = 0
   for (const row of payload.sessions) {
-    const record = cacheRecords.get(row.id)
-    const cached = typeof record?.rows?.title?.val === 'string' ? record.rows.title.val.trim() : ''
+    const cached = cachedTitleOf(row.id)
     if (row.title === '') {
-      // A forked session's own checkpoint cannot be matched by a listing: the
-      // inherited cut lives outside the header, and the shipped listing path has
-      // exactly the same gap (it also passes 0). Its title is genuinely not
-      // reachable from here, so this is expected, not a bug.
-      if (cached.length > 0 && record.rows.title.ver === 1 && record.identity.isSeeded !== true) shouldHaveTitle += 1
+      if (cached.length > 0) shouldHaveTitle += 1
       continue
     }
     const expected = cached.length > 120 ? `${cached.slice(0, 120)}…` : cached
@@ -224,16 +198,14 @@ if (payload.ok !== true) {
   }
   console.log(`\n  titles matching the cache byte for byte: ${matched}`)
   console.log(`  titles a row would have to invent:       ${invented}`)
-  console.log(`  untitled rows whose cache has a title:   ${shouldHaveTitle} (forked sessions are excluded on purpose)`)
+  console.log(`  untitled rows whose cache has a title:   ${shouldHaveTitle}`)
   console.log(`  rows with a real activity time:          ${payload.sessions.filter((row) => row.lastUsedAt !== '').length} / ${payload.sessions.length}`)
   console.log(`  rows with a workspace label:             ${payload.sessions.filter((row) => row.workspace !== '').length} / ${payload.sessions.length}`)
-  // A session living outside every registered workspace is honestly labelled by
-  // its directory name in the panel, so no label is not a failure.
-  const unscanned = sessionLogTimes(home)
-  if (unscanned.scanned !== true) fail(`the session-log scan failed: ${unscanned.error}`)
+  const scanned = sessionLogTimes(home)
+  if (scanned.scanned !== true) fail(`the session-log scan failed: ${scanned.error}`)
   if (invented !== 0) fail('a row would show a title the cache does not hold')
   if (shouldHaveTitle !== 0) fail('a row that has a cache title is shown untitled')
-  if (matched === 0) fail('no title resolved at all — the cache contract is being called wrongly')
+  if (matched === 0) fail('no title resolved at all — the whole point of the picker is missing')
   if (payload.shown > MAX_CANDIDATES) fail(`the cap ${MAX_CANDIDATES} was exceeded`)
 }
 
