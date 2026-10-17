@@ -1296,9 +1296,16 @@ function registerTools(ctx, state) {
           // recovery the panel shows an empty room list, and without this line
           // nothing anywhere says the messages survived. Reported as a fact, with
           // the count, rather than inferred from the empty ledger.
+          //
+          // ⚠️ `deliveries` is the wake-up audit log, not a room transcript — it
+          // lives in the same directory and `transcriptGroupIds` has no way to
+          // tell. Counting it as an orphan made the probe report "1 transcript the
+          // ledger does not list" on a perfectly healthy deployment (measured on
+          // 0.2.1-rc.1, 2026-10-17). A diagnostic that cries wolf once is a
+          // diagnostic people stop reading.
           orphanedTranscripts: (() => {
             const known = new Set(state.ledger.groups.map((group) => group.id))
-            return transcriptGroupIds(state.root).filter((id) => !known.has(id))
+            return transcriptGroupIds(state.root).filter((id) => id !== 'deliveries' && !known.has(id))
           })(),
         }
       },

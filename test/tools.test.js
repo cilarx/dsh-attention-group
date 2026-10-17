@@ -667,6 +667,33 @@ test('a corrupt delivery audit log cannot take the diagnostic tool down with it'
   assert.equal(probe.deliveryAudit.recent[1].delivered, true)
 })
 
+test('the wake-up audit log is not reported as an orphaned room transcript', async () => {
+  // `deliveries.jsonl` sits in the same directory as the per-room transcripts and
+  // is named the same way, so `transcriptGroupIds` cannot tell them apart. Counting
+  // it as an orphan made `attention_probe` announce "1 transcript the ledger does
+  // not list" on a perfectly healthy deployment — measured on DSH 0.2.1-rc.1,
+  // 2026-10-17. A diagnostic that cries wolf once is one people stop reading.
+  const { tools } = fakeContext()
+  const created = await callTool(tools, 'attention_group_create', { title: 'orphan room' }, agentA)
+  const root = join(dataHome, 'attention-group')
+  mkdirSync(join(root, 'messages'), { recursive: true })
+  writeFileSync(join(root, 'messages', 'deliveries.jsonl'), '{"at":"2026-10-17T00:00:00.000Z","delivered":true}\n')
+
+  const probe = await callTool(tools, 'attention_probe', {}, agentA)
+  assert.equal(
+    probe.orphanedTranscripts.includes('deliveries'),
+    false,
+    'the audit log is not a room and must never be listed as one',
+  )
+
+  // A REAL orphan must still be surfaced: the fix must not have simply turned the
+  // feature off, which would have hidden the thing it exists to report.
+  writeFileSync(join(root, 'messages', 'lost-room.jsonl'), '{"seq":1,"at":"2026-10-17T00:00:00.000Z","text":"still here"}\n')
+  const after = await callTool(tools, 'attention_probe', {}, agentA)
+  assert.equal(after.orphanedTranscripts.includes('lost-room'), true, 'a real orphan must still be surfaced')
+  assert.equal(after.orphanedTranscripts.includes(created.groupId), false, 'a known room is not an orphan')
+})
+
 test('A-6: a deployment with many live sessions cannot inflate the probe result', async () => {
   // `MAX_RENDER_LINES` bounds how many lines a result carries; the probe listed
   // every live agent unconditionally, so 300 live sessions meant a 308-line tool

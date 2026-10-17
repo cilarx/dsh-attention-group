@@ -44,7 +44,8 @@ Three consequences that are design rules here, not accidents:
 
 ### What you need
 
-- DSH **0.2.0-rc.2** (this is the version every interface here was verified against).
+- DSH **0.2.1-rc.1** (this is the version every interface here was verified against; it was
+  first built against 0.2.0-rc.2 and re-verified against 0.2.1-rc.1).
 - A profile to install into. The examples below use `--profile desktop`.
 
 ### Install
@@ -376,8 +377,14 @@ one thing two switches must agree on first.
 
 Written down because they are true, not because they are small:
 
-- **DSH version.** Everything here was verified on **DSH 0.2.0-rc.2**. The plugin's interface
-  shape is only claimed for that version; newer DSH releases may move the services it reads.
+- **DSH version.** Everything here was verified on **DSH 0.2.1-rc.1**, and re-checked against it
+  after the 0.2.0-rc.2 → 0.2.1-rc.1 upgrade: every service this plugin reads is still present and
+  the session format is still v4. That check was done by reading the running runtime, not by
+  assuming — `agents.resume` still takes `{resumeSessionId, agentOptions, setup}`, the message
+  `source.kind` rule still accepts any producer-owned kind except the retired `"plugin"`, and the
+  tool registry still compiles the inline `required: true` parameter dialect into a standard JSON
+  Schema (confirmed through the runtime's own tool-inspection provider). The interface shape is
+  only claimed for 0.2.x; a minor DSH release can still move a service it reads.
 - **Host-side changes need a restart.** A restart is required after installing or changing
   host code; a plugin-panel toggle does not re-import the module (measured: a new tool stayed
   `unknown tool`). The browser half is served as a **disk snapshot** — its changes need a
