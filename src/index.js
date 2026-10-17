@@ -303,6 +303,16 @@ const PANEL_KNOBS = {
     { value: 'nobody', label: '冻结', hint: '谁都拉不进人，成员表锁死。' },
   ],
   memberKinds: ['session', 'user', 'admin', 'bot', 'liaison'],
+  // R9+ (user's decision, 2026-10-17): the room REMINDS, it never compacts by
+  // itself. Generating a summary spends a model turn in someone else's session, so
+  // it stays a deliberate click; this knob only decides when the panel starts
+  // saying "this room has N messages without a summary".
+  summaryEveries: [
+    { value: 0, label: '关', hint: '不提醒。' },
+    { value: 200, label: '200 条', hint: '攒到 200 条没摘要时，面板里出现提醒。' },
+    { value: 500, label: '500 条', hint: '默认。够大，平时不会一直念。' },
+    { value: 2000, label: '2000 条', hint: '只有真的很长才提醒。' },
+  ],
   // R10: what a liaison is allowed to carry. Declared once, here, so the panel
   // cannot offer a mode the host would refuse.
   relayModes: RELAY_MODES,
@@ -399,6 +409,23 @@ function countUnread(root, groupId, member, excludeSeq) {
       row.fromId !== member.id &&
       row.seq !== excludeSeq,
   ).length
+}
+
+/** Summary snapshots this room has stored, oldest first. Junk rows are dropped. */
+function groupSummaries(group) {
+  if (!Array.isArray(group?.summaries)) return []
+  return group.summaries.filter(
+    (row) => row !== null && typeof row === 'object' && typeof row.text === 'string' && row.text.length > 0,
+  )
+}
+
+/** The highest message number covered by a stored summary, or 0 when there is none. */
+function summarizedUpTo(group) {
+  let upTo = 0
+  for (const row of groupSummaries(group)) {
+    if (Number.isFinite(row.upToSeq) && row.upToSeq > upTo) upTo = row.upToSeq
+  }
+  return upTo
 }
 
 /**
@@ -3006,6 +3033,24 @@ function panelGroupDetail(state, group) {
     // R6: when this is on, a member sees "群聊未读：…" in its own system prompt on
     // every step, so it learns about waiting messages even when nobody woke it.
     promptUnread: group.promptUnread === true,
+    // R9+: how many messages have no summary yet, and how many it takes for the
+    // panel to NAG. The panel never generates anything on its own — a summary
+    // costs a model turn, so it is always a deliberate click (2026-10-17).
+    summary: (() => {
+      const upToSeq = summarizedUpTo(group)
+      const latestSeq = all.reduce((max, row) => (Number.isFinite(row.seq) && row.seq > max ? row.seq : max), 0)
+      const every = typeof group.summaryEvery === 'number' && group.summaryEvery > 0 ? group.summaryEvery : 500
+      const stored = groupSummaries(group)
+      const last = stored.length > 0 ? stored[stored.length - 1] : undefined
+      return {
+        every,
+        upToSeq,
+        latestSeq,
+        pending: Math.max(0, latestSeq - upToSeq),
+        count: stored.length,
+        ...(last !== undefined && typeof last.at === 'string' ? { lastAt: last.at } : {}),
+      }
+    })(),
     // R10: where this room relays to, and what each link is willing to carry.
     links: linkSummary(group).routes,
     sink: {
@@ -3261,6 +3306,15 @@ async function applyPanelAction(state, body) {
     group.promptUnread = body?.promptUnread === true
     save()
     return done({ promptUnread: group.promptUnread })
+  }
+
+  if (action === 'summaryEvery') {
+    const legal = PANEL_KNOBS.summaryEveries.map((row) => row.value)
+    const wanted = Number(body?.summaryEvery)
+    if (!legal.includes(wanted)) return { ok: false, error: `summaryEvery must be one of ${legal.join(' / ')}` }
+    group.summaryEvery = wanted
+    save()
+    return done({ summaryEvery: wanted })
   }
 
   if (action === 'joinPolicy') {

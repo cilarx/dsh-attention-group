@@ -1784,6 +1784,40 @@ window.__ModuleLoader__.load({
               h(
                 Field,
                 {
+                  label: '群史摘要提醒',
+                  value: group.summary ? countOf(group.summary.every) + ' 条' : '—（宿主未报告）',
+                  hint:
+                    '只提醒，不强迫：攒到设定条数还没摘要时，面板里会出现一行提醒。' +
+                    '生成摘要要花一次模型调用，所以永远由你决定，插件不会自己动手。',
+                },
+                h(
+                  'div',
+                  null,
+                  h(Segmented, {
+                    options: (Array.isArray(knobs.summaryEveries) ? knobs.summaryEveries : []).map(function (row) {
+                      return { value: String(row.value), label: row.label, hint: row.hint }
+                    }),
+                    value: group.summary ? String(group.summary.every) : undefined,
+                    onPick: function (value) {
+                      setKnob('summaryEvery', { summaryEvery: Number(value) })
+                    },
+                  }),
+                  group.summary && group.summary.pending >= group.summary.every
+                    ? h(
+                        'div',
+                        { style: S.notice },
+                        '提醒：这个群已有 ' +
+                          countOf(group.summary.pending) +
+                          ' 条消息没摘要（阈值 ' +
+                          countOf(group.summary.every) +
+                          ' 条）。要不要摘要由你决定 —— 插件不会自己压缩，也不会删任何历史。',
+                      )
+                    : null,
+                ),
+              ),
+              h(
+                Field,
+                {
                   label: '群用途及群规',
                   hint:
                     '成员被叫醒时会在消息里看到这段。先写清「这个群是干什么的」，再写规矩 —— ' +

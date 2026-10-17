@@ -91,6 +91,37 @@ test('an opted-in room announces its unread count in the member prompt, and only
   assert.equal(lineFor(memberId), '')
 })
 
+test('the summary reminder counts un-summarised messages and never acts on its own', async () => {
+  // The user's decision (2026-10-17): remind at a limit, but never compact by
+  // itself. A summary costs a model turn in someone else's session, so the panel
+  // may only NAG. This test pins the counting, the knob table and the refusal —
+  // and that nagging changes nothing on disk.
+  boot()
+  const groupId = await newRoom('摘要提醒群')
+  await post({ action: 'post', group: groupId, text: '第一条' })
+  await post({ action: 'post', group: groupId, text: '第二条' })
+  const detail = async () => (await get(`?group=${groupId}`)).json.group
+
+  const before = await detail()
+  assert.equal(before.summary.every, 500, 'the default threshold is large, not zero')
+  assert.equal(before.summary.pending, 2, 'two messages and no summary yet')
+  assert.equal(before.summary.count, 0)
+
+  // The panel renders the host's own table, so an illegal value must be refused
+  // by NAMING the legal ones (the panel and the host cannot drift).
+  const refused = await post({ action: 'summaryEvery', group: groupId, summaryEvery: 12345 })
+  assert.equal(refused.status, 400)
+  assert.match(refused.json.error, /0 \/ 200 \/ 500 \/ 2000/)
+
+  const accepted = await post({ action: 'summaryEvery', group: groupId, summaryEvery: 200 })
+  assert.equal(accepted.json.summaryEvery, 200)
+  assert.equal((await detail()).summary.every, 200)
+
+  // Reminding is inert: no summary recorded, no message appended.
+  assert.equal((await detail()).summary.count, 0)
+  assert.equal(host.messagesOnDisk(groupId).trim().split('\n').length, 2)
+})
+
 test('one GET returns the room list, per-room unread, and the knob table', async () => {
   boot()
   const groupId = await newRoom('读模型群')
