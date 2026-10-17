@@ -18,7 +18,7 @@
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { readLedger, writeLedger, appendMessage, readMessages, readMessagesWithStatus, resolveDataRoot, appendDelivery, readDeliveries, transcriptGroupIds } from './store.js'
+import { readLedger, writeLedger, appendMessage, readMessages, readMessagesWithStatus, resolveDataRoot, resolveDshHome, appendDelivery, readDeliveries, transcriptGroupIds } from './store.js'
 import { ROUTE_MODE, REASON, route, extractMentions, hasMentionAll } from './router.js'
 import { renderWakeMessage } from './router.js'
 import {
@@ -34,6 +34,7 @@ import {
 } from './sink.js'
 import { buildDigest, resolveRange } from './digest.js'
 import { RELAY_MODES, RELAY_MODE, newLink, shouldRelay, relayRecord, linkSummary } from './relay.js'
+import { listSessionCandidates, MAX_CANDIDATES } from './sessions.js'
 
 /** Cordis plugin name. Must match the bundle row id. */
 const name = 'attention-group'
@@ -3217,6 +3218,16 @@ function registerPanelRoute(webServer, state) {
           const wanted = url.searchParams.get('group')
 
           if (req.method === 'GET' || req.method === 'HEAD') {
+            // The 「拉人」 picker asks for its session list SEPARATELY, and only
+            // when somebody opens it. It is no longer expensive (titles come from
+            // the projection cache, not from the session logs — see
+            // `src/sessions.js`), but this route is polled every five seconds, and
+            // rebuilding a forty-row list that nobody is looking at is still work.
+            if (url.searchParams.get('candidates') === '1') {
+              const payload = await panelCandidates(state, url.searchParams.get('group'))
+              sendJson(res, payload.ok === true ? 200 : 404, payload)
+              return
+            }
             const payload = panelState(state, wanted)
             sendJson(res, payload.ok === true ? 200 : 404, payload)
             return
@@ -3442,6 +3453,80 @@ function panelGroupDetail(state, group) {
       mentions: Array.isArray(row.mentions) ? row.mentions : [],
     })),
   }
+}
+
+/**
+ * How long one candidate list stays reusable.
+ *
+ * A person clicks into the field, changes their mind and clicks again; the panel
+ * also re-renders on a five-second poll. Fifteen seconds is long enough to make
+ * that free and short enough that a session started a moment ago shows up.
+ */
+const CANDIDATE_CACHE_MS = 15000
+
+/**
+ * Which member ids this room already has, for the picker's 「已在群里」 tag.
+ *
+ * @param {object} state - plugin state.
+ * @param {string|null} wantedGroup - group id from the query string.
+ * @returns {Set<string>} member ids (empty when the room is unknown).
+ */
+function memberIdsOf(state, wantedGroup) {
+  if (typeof wantedGroup !== 'string' || wantedGroup.length === 0) return new Set()
+  const group = state.ledger.groups.find((candidate) => candidate.id === wantedGroup)
+  return new Set(safeMembers(group).map((member) => String(member?.id)))
+}
+
+/**
+ * Mark which candidates are already in this room.
+ *
+ * Kept out of the cached part on purpose: the cache holds ONE catalogue, and
+ * membership is a per-room fact. Marking after the cache means a second room
+ * cannot inherit the first room's tags.
+ *
+ * @param {object} payload - candidate payload.
+ * @param {Set<string>} memberIds - ids in the room.
+ * @returns {object} the same payload with `member` set per row.
+ */
+function withMembership(payload, memberIds) {
+  if (payload?.ok !== true || !Array.isArray(payload.sessions)) return payload
+  return {
+    ...payload,
+    sessions: payload.sessions.map((row) => ({ ...row, member: memberIds.has(String(row?.id ?? '')) })),
+  }
+}
+
+/**
+ * The 「拉人」 picker's list, with a short cache.
+ *
+ * The panel's `?candidates=1` read exists so a person can CLICK a session instead
+ * of pasting its id — the request that started this (2026-10-17) said titles
+ * alone are not enough, because this machine has sessions whose titles differ by
+ * one character, so each row also carries its workspace and last-activity time.
+ *
+ * Only SUCCESSFUL lists are cached: a deployment that gains a `sessionQuery`
+ * service after boot (or whose sessions directory appears later) must not keep
+ * serving the first refusal for the life of the process.
+ *
+ * @param {object} state - plugin state.
+ * @param {string|null} wantedGroup - group whose members should be marked.
+ * @returns {Promise<object>} candidate payload.
+ */
+async function panelCandidates(state, wantedGroup) {
+  const now = Date.now()
+  const cached = state.candidatesCache
+  if (cached !== undefined && now - cached.at < CANDIDATE_CACHE_MS) {
+    return withMembership(cached.payload, memberIdsOf(state, wantedGroup))
+  }
+  const payload = await listSessionCandidates({
+    ctx: state.ctx,
+    // The DSH home is captured at apply() time from the SAME environment the data
+    // root came from, so the two can never point at different deployments.
+    dshHome: state.dshHome,
+    max: MAX_CANDIDATES,
+  })
+  if (payload.ok === true) state.candidatesCache = { at: now, payload }
+  return withMembership(payload, memberIdsOf(state, wantedGroup))
 }
 
 /**
@@ -3941,7 +4026,7 @@ function apply(ctx) {
   // The ledger's read status is kept too, and for the same reason: "there are no
   // rooms" and "I could not open the room list" are different facts, and the
   // panel route has no way to re-derive the second one later.
-  const state = { root, ledger, ctx, ledgerRepairs: Array.isArray(repairs) ? repairs : [] }
+  const state = { root, ledger, ctx, ledgerRepairs: Array.isArray(repairs) ? repairs : [], dshHome: resolveDshHome() }
   if (state.ledgerRepairs.length > 0) {
     // Rooms that had to be repaired on load are still usable — `store.js` fills
     // in the missing fields — but the human should hear about it rather than

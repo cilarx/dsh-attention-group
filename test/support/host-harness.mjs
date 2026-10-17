@@ -43,6 +43,13 @@ export const installedEntry = pluginEntry
  *     `@deepseek-ai/dsh-web-app` provides and a headless deployment does not.
  *     Every `selectModel` call lands in `handle.effortCalls`. Left out by
  *     default, so the "no such service" path is the one most tests exercise.
+ *   - `sessionCatalog`: session records the fake `sessionQuery` should list
+ *     (`{id, title, cwd, createdAt, live, origin, agentPreset}`), so the panel's
+ *     「拉人」 picker can be tested against a deployment that HAS sessions. Each
+ *     entry is also given a `readSession` route, so the cold-resume path keeps
+ *     working in the same test.
+ *   - `workspaces`: workspace records the fake `workspaceRegistry` should list
+ *     (`{title, path, sessionIds}`), for the picker's workspace labels.
  * @returns {Promise<object>} host handle.
  */
 export async function createHost(options = {}) {
@@ -50,6 +57,8 @@ export async function createHost(options = {}) {
   const liveIds = new Set(Array.isArray(options.liveSessions) ? options.liveSessions.map(String) : [])
   const withSessionController = options.withSessionController === true
   const sessionRoutes = options.sessionRoutes ?? {}
+  const sessionCatalog = Array.isArray(options.sessionCatalog) ? options.sessionCatalog : undefined
+  const workspaces = Array.isArray(options.workspaces) ? options.workspaces : []
   const effortCalls = []
   const delivered = []
   if (!existsSync(pluginEntry)) {
@@ -156,12 +165,72 @@ export async function createHost(options = {}) {
         // provider/model — both when cold-resuming it and when changing its effort
         // in place. Supplying it here is what lets those two paths be tested
         // without a real session log on disk.
-        if (name === 'sessionQuery' && Object.keys(sessionRoutes).length > 0) {
+        //
+        // `listSessions` is the same service's catalogue half, which the panel's
+        // 「拉人」 picker reads. Only mounted when a test asked for a catalogue, so
+        // every other suite keeps exercising the "service absent -> degrade" path.
+        //
+        // Titles are NOT read here: the picker takes those from the projection
+        // cache (`sessionProjectionCache`), because folding them out of a session
+        // log costs a full log read per row. The stub below keeps that split
+        // honest — a test that wants titles has to declare a projection cache too.
+        if (name === 'sessionQuery' && (Object.keys(sessionRoutes).length > 0 || sessionCatalog !== undefined)) {
           return {
             async readSession(sessionId) {
               const route = sessionRoutes[String(sessionId)]
               if (route === undefined) return { events: [] }
               return { events: [{ type: 'request/header', data: { header: { config: route } } }] }
+            },
+            ...(sessionCatalog === undefined
+              ? {}
+              : {
+                  // The real service returns newest-first records; the picker does
+                  // its own ordering, so the stub deliberately returns them in the
+                  // order the test declared them.
+                  async listSessions() {
+                    return sessionCatalog.map((row) => ({
+                      header: {
+                        version: 4,
+                        id: String(row.id),
+                        createdAt: Number.isFinite(row.createdAt) ? row.createdAt : 0,
+                        isSeeded: row.isSeeded === true,
+                        ...(typeof row.cwd === 'string' ? { cwd: row.cwd } : {}),
+                        ...(typeof row.origin === 'string' ? { origin: row.origin } : {}),
+                        ...(typeof row.agentPreset === 'string' ? { agentPreset: row.agentPreset } : {}),
+                      },
+                      live: row.live === true,
+                      persisted: true,
+                    }))
+                  },
+                }),
+          }
+        }
+        if (name === 'sessionProjectionCache' && sessionCatalog !== undefined) {
+          // The real service: "the zero-I/O listing read". A row's `title` here is
+          // the projection value the sidebar shows — served straight from the
+          // cache, never folded out of a log.
+          return {
+            cachedSnapshot(meta) {
+              const row = sessionCatalog.find((candidate) => String(candidate.id) === String(meta?.id))
+              if (row === undefined || typeof row.title !== 'string' || row.title.length === 0) return undefined
+              return { asOfSeq: 1, values: { title: row.title } }
+            },
+            cachedPredecessorTitle() {
+              return undefined
+            },
+          }
+        }
+        if (name === 'workspaceRegistry' && workspaces.length > 0) {
+          return {
+            list() {
+              return workspaces.map((row) => ({
+                id: `workspace-${row.title}`,
+                title: String(row.title),
+                path: String(row.path ?? ''),
+                createdAt: '2026-10-01T00:00:00.000Z',
+                updatedAt: '2026-10-01T00:00:00.000Z',
+                sessionIds: Array.isArray(row.sessionIds) ? row.sessionIds.map(String) : [],
+              }))
             },
           }
         }

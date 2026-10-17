@@ -22,7 +22,7 @@
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync, existsSync, mkdirSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createHost } from './support/host-harness.mjs'
@@ -572,4 +572,93 @@ test('A-12: a request body larger than the cap is refused with 413 instead of be
   // The cap must not break ordinary use — the next request still works.
   const normal = await call({ method: 'POST', body: { action: 'create', title: 'after the cap' } })
   assert.equal(normal.status, 200, 'a normal body must still be accepted')
+})
+
+// ---------------------------------------------------------------------------
+// The 「拉人」 picker's host side (2026-10-17).
+//
+// The panel must be able to offer sessions instead of a blank id box, which means
+// the host has to answer a query it never answered before: which sessions exist,
+// what are they called, where do they live, and when did each last do anything.
+// ---------------------------------------------------------------------------
+
+test('the picker refuses with the missing capability named, never with an empty list', async () => {
+  // A headless deployment has no `sessionQuery`. "You have no sessions" would be
+  // false and would send the human looking for the problem in the wrong place.
+  boot()
+  const response = await get('?candidates=1')
+  assert.equal(response.status, 404)
+  assert.equal(response.json.ok, false)
+  assert.match(String(response.json.error), /sessionQuery/u)
+  assert.equal(response.json.sessions, undefined)
+})
+
+test('the picker lists sessions with title, workspace and last activity, and marks room members', async () => {
+  const catalog = [
+    { id: 'session-1111aaaa-1111-1111-1111-111111111111', title: '插件工程协调', cwd: 'J:\\work', createdAt: 30, live: true },
+    { id: 'session-2222bbbb-2222-2222-2222-222222222222', title: '测试群', cwd: 'C:\\Users\\test\\.dsh\\bot-workspace', createdAt: 20 },
+    { id: 'session-3333cccc-3333-3333-3333-333333333333', title: '', createdAt: 10, origin: 'subagent' },
+  ]
+  // A SEPARATE deployment: this one has a session catalogue, and the shared host
+  // deliberately has none (so every other test keeps covering the "absent service"
+  // path). Its own DSH_HOME is what the log mtimes are read from.
+  const picker = await createHost({
+    sessionCatalog: catalog,
+    workspaces: [
+      { title: 'DSH默认', path: 'J:\\work', sessionIds: [catalog[0].id] },
+      { title: 'DS Bot', path: 'C:\\Users\\test\\.dsh\\bot-workspace', sessionIds: [catalog[1].id] },
+    ],
+  })
+  try {
+    picker.boot()
+    const home = picker.home
+    const logDir = join(home, 'sessions', '--J-work--', catalog[0].id)
+    mkdirSync(logDir, { recursive: true })
+    const log = join(logDir, 'session.v4.jsonl.zstd')
+    writeFileSync(log, 'log')
+    utimesSync(log, new Date('2026-10-17T12:00:00.000Z'), new Date('2026-10-17T12:00:00.000Z'))
+
+    const roomA = await picker.newRoom('选人群 A')
+    await picker.post({ action: 'join', group: roomA, memberId: catalog[1].id, memberName: '测试群' })
+
+    const listed = await picker.get(`?candidates=1&group=${roomA}`)
+    assert.equal(listed.status, 200)
+    assert.equal(listed.json.ok, true)
+    const byId = new Map(listed.json.sessions.map((row) => [row.id, row]))
+    assert.equal(listed.json.sessions.length, 3)
+    assert.equal(byId.get(catalog[0].id).title, '插件工程协调', 'the title the sidebar shows must travel')
+    assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认', 'the workspace is the tie-breaker for similar titles')
+    assert.equal(byId.get(catalog[0].id).lastUsedAt, '2026-10-17T12:00:00.000Z', 'last activity comes from the session log')
+    assert.equal(byId.get(catalog[0].id).live, true)
+    assert.equal(byId.get(catalog[0].id).member, false)
+    assert.equal(byId.get(catalog[1].id).member, true, 'a session already in this room must say so')
+    assert.equal(byId.get(catalog[2].id).title, '')
+    assert.equal(byId.get(catalog[2].id).subagent, true)
+    assert.equal(byId.get(catalog[2].id).lastUsedAt, '', 'a session with no log has no time, not a guess')
+    assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认')
+
+    // ⚠️ The list is cached (titles cost a log read per row), and membership is
+    // per-room. A second room must NOT inherit the first room's 「已在群里」 tags.
+    const roomB = await picker.newRoom('选人群 B')
+    await picker.post({ action: 'join', group: roomB, memberId: catalog[0].id, memberName: '插件工程协调' })
+    const listedB = await picker.get(`?candidates=1&group=${roomB}`)
+    const byIdB = new Map(listedB.json.sessions.map((row) => [row.id, row]))
+    assert.equal(byIdB.get(catalog[0].id).member, true, 'the second room sees its own member')
+    assert.equal(byIdB.get(catalog[1].id).member, false, 'and must not inherit the first room\'s tag')
+    // A session with no title yet is not a read failure — it is counted as
+    // untitled, so the panel can say 「有 1 个会话还没有标题」 instead of alarming
+    // the human about a broken catalogue.
+    assert.equal(listedB.json.titlesStatus, 'ok')
+    assert.equal(listedB.json.untitled, 1)
+
+    // The new query parameter must not disturb the reads that already existed.
+    const detail = await picker.get(`?group=${roomA}`)
+    assert.equal(detail.status, 200)
+    assert.equal(detail.json.group.id, roomA)
+    const plain = await picker.get('')
+    assert.equal(plain.status, 200)
+    assert.ok(Array.isArray(plain.json.groups), 'the plain list read still returns the room list')
+  } finally {
+    picker.cleanup()
+  }
 })

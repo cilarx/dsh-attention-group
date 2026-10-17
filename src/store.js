@@ -27,8 +27,23 @@ export const LEDGER_VERSION = 1
  * @returns {string} absolute data root.
  */
 export function resolveDataRoot(env = process.env) {
-  const home = typeof env.DSH_HOME === 'string' && env.DSH_HOME.length > 0 ? env.DSH_HOME : join(homedir(), '.dsh')
-  return join(home, 'attention-group')
+  return join(resolveDshHome(env), 'attention-group')
+}
+
+/**
+ * Resolve the DSH home itself — the parent of this plugin's data root.
+ *
+ * Needed by exactly one caller: the 「拉人」 picker wants the mtime of each
+ * session log, and session logs live at `<DSH_HOME>/sessions/…`, not inside this
+ * plugin's own directory. Same `DSH_HOME` override as {@link resolveDataRoot}, so
+ * a test or a second deployment can point both at one throwaway directory and
+ * they cannot disagree.
+ *
+ * @param {NodeJS.ProcessEnv} [env] - environment to read.
+ * @returns {string} absolute DSH home.
+ */
+export function resolveDshHome(env = process.env) {
+  return typeof env.DSH_HOME === 'string' && env.DSH_HOME.length > 0 ? env.DSH_HOME : join(homedir(), '.dsh')
 }
 
 /** An empty ledger. */

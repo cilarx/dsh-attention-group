@@ -102,6 +102,25 @@ window.__ModuleLoader__.load({
       }).then(readBody)
     }
 
+    /**
+     * Ask the host which sessions could be invited into a room.
+     *
+     * A SEPARATE read, asked for only when the picker opens: it costs the host one
+     * session-log read per candidate (titles live in the session logs), so paying
+     * for it on every one of the panel's five-second polls would make an idle
+     * panel do constant disk work.
+     *
+     * `group` is passed so the host can mark the members a room already has. It is
+     * optional: without it the list still works, the tags just stay off.
+     *
+     * @param {string} groupId - the room being edited, or '' for none.
+     * @returns {Promise<object>} the host's candidate payload.
+     */
+    function loadSessions(groupId) {
+      var query = groupId === undefined || groupId === null || groupId === '' ? '' : '&group=' + encodeURIComponent(groupId)
+      return fetch(API + '?candidates=1' + query, { cache: 'no-store' }).then(readBody)
+    }
+
     /** A display string that can never be the literal word "undefined". */
     function str(value, fallback) {
       if (typeof value === 'string' && value.length > 0) return value
@@ -336,6 +355,75 @@ window.__ModuleLoader__.load({
       return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
     }
 
+    /**
+     * How long ago something happened, or an honest "unknown".
+     *
+     * The 「拉人」 picker shows when each session last did anything, because two
+     * sessions can carry the same title. A relative figure is what a person
+     * compares at a glance ("this one moved four minutes ago, that one last
+     * week"), so both are given: relative while it is recent, a date once it is
+     * old.
+     *
+     * ⚠️ C-09: an ABSENT timestamp must not render as a time. The host reports
+     * `''` when it could not stat a session log, and the panel then says so —
+     * "0 分钟前" would be a made-up fact.
+     *
+     * @param {string} value - ISO instant, or '' when the host has none.
+     * @returns {string} display text.
+     */
+    function agoText(value) {
+      if (typeof value !== 'string' || value.length === 0) return '活动时间未知'
+      var time = new Date(value).getTime()
+      if (!Number.isFinite(time)) return '活动时间未知'
+      var seconds = Math.floor((Date.now() - time) / 1000)
+      if (!Number.isFinite(seconds)) return '活动时间未知'
+      // A clock skew between host and browser can put a write slightly ahead.
+      if (seconds < 0) seconds = 0
+      if (seconds < 60) return '刚刚'
+      var minutes = Math.floor(seconds / 60)
+      if (minutes < 60) return minutes + ' 分钟前'
+      var hours = Math.floor(minutes / 60)
+      if (hours < 24) return hours + ' 小时前'
+      var days = Math.floor(hours / 24)
+      if (days < 30) return days + ' 天前'
+      return stampOf(value)
+    }
+
+    /**
+     * The title a candidate session should be shown under.
+     *
+     * A session with no folded title is NOT nameless to its owner — it simply has
+     * no title event yet. Printing its id in the title slot would make the list
+     * look like the ids it was supposed to replace, so it says 「（无标题会话）」
+     * and the row's tooltip still carries the id.
+     *
+     * @param {object} row - candidate row.
+     * @returns {string} display title.
+     */
+    function candidateTitle(row) {
+      var title = safeText(row === null || row === undefined ? '' : row.title)
+      if (title.length > 0) return title
+      return '（无标题会话）'
+    }
+
+    /**
+     * Where a candidate lives: the workspace name the host resolved, else the
+     * last path segment it reported, else an explicit unknown.
+     *
+     * @param {object} row - candidate row.
+     * @returns {string} display text.
+     */
+    function candidateWorkspace(row) {
+      var workspace = safeText(row === null || row === undefined ? '' : row.workspace)
+      if (workspace.length > 0) return workspace
+      var cwd = safeText(row === null || row === undefined ? '' : row.cwd)
+      if (cwd.length === 0) return '工作区未知'
+      var parts = cwd.split(/[\\/]+/u).filter(function (part) {
+        return part.length > 0
+      })
+      return parts.length === 0 ? cwd : parts[parts.length - 1]
+    }
+
     var S = {
       wrap: { display: 'flex', height: '100%', minHeight: 0, fontSize: '13px' },
       list: {
@@ -544,6 +632,44 @@ window.__ModuleLoader__.load({
         whiteSpace: 'pre-wrap',
         wordBreak: 'break-word',
       },
+      // The 「拉人」 picker. Neutral translucent surfaces only, like every other
+      // row in this panel: a theme token here once turned the whole panel into
+      // opaque white blocks (see c22), and the accent below is the one literal
+      // that is safe in both themes.
+      candidateBox: {
+        marginTop: '6px',
+        border: '1px solid rgba(127,127,127,.22)',
+        borderRadius: '8px',
+        background: 'rgba(127,127,127,.06)',
+        overflow: 'hidden',
+      },
+      candidateHead: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        flexWrap: 'wrap',
+        padding: '6px 8px',
+        borderBottom: '1px solid rgba(127,127,127,.14)',
+        fontSize: '11px',
+        opacity: 0.72,
+      },
+      candidateHeadText: { flex: '1 1 180px', minWidth: 0 },
+      candidateScroll: { maxHeight: '260px', overflowY: 'auto' },
+      candidateRow: {
+        display: 'block',
+        width: '100%',
+        textAlign: 'left',
+        padding: '6px 8px',
+        border: 0,
+        borderTop: '1px solid rgba(127,127,127,.1)',
+        background: 'transparent',
+        color: 'inherit',
+        cursor: 'pointer',
+        font: 'inherit',
+      },
+      candidateTitle: { display: 'block', fontWeight: 600, overflowWrap: 'anywhere', wordBreak: 'break-word' },
+      candidateMeta: { display: 'block', fontSize: '11px', opacity: 0.62, marginTop: '2px', overflowWrap: 'anywhere' },
+      candidateNote: { padding: '6px 8px', fontSize: '11px', lineHeight: 1.5, opacity: 0.8 },
     }
 
     /** The sidebar button: the sidebar owns the chrome, so this is the icon. */
@@ -714,6 +840,22 @@ window.__ModuleLoader__.load({
       var [newMemberId, setNewMemberId] = useState('')
       var [newMemberName, setNewMemberName] = useState('')
       var [newMemberKind, setNewMemberKind] = useState('session')
+      // The 「拉人」 picker (2026-10-17). Its list is read lazily, when somebody
+      // opens the field, because building it costs the host one session-log read
+      // per candidate (titles live there) — not something to pay every poll.
+      var [candidates, setCandidates] = useState({
+        open: false,
+        loading: false,
+        error: '',
+        rows: [],
+        total: 0,
+        shown: 0,
+        titlesStatus: '',
+        untitled: 0,
+        timeSource: '',
+        timeError: '',
+        at: 0,
+      })
       var [pendingRemove, setPendingRemove] = useState('')
       var [sinkDirDraft, setSinkDirDraft] = useState(null)
       var [exportNote, setExportNote] = useState('')
@@ -1235,6 +1377,136 @@ window.__ModuleLoader__.load({
           .catch(fail)
       }
 
+      /**
+       * A name for the invited member that no existing member already answers to.
+       *
+       * A room addresses people by NAME, so two members with one name are woken
+       * together by a single `@名字`. Pre-filling a title that some other member
+       * already uses would quietly create that situation on the human's behalf,
+       * so a duplicate gets a numeric suffix. The human may still type whatever
+       * they like; the panel just must not do it for them.
+       */
+      function freeMemberName(title) {
+        var wanted = typeof title === 'string' ? title.trim() : ''
+        if (wanted.length === 0) return ''
+        var members = state.group !== null && Array.isArray(state.group.members) ? state.group.members : []
+        var taken = {}
+        members.forEach(function (member) {
+          if (member !== null && typeof member === 'object' && typeof member.name === 'string') taken[member.name] = true
+        })
+        if (taken[wanted] !== true) return wanted
+        for (var index = 2; index < 100; index += 1) {
+          var candidate = wanted + ' ' + index
+          if (taken[candidate] !== true) return candidate
+        }
+        return ''
+      }
+
+      /**
+       * What the picker's filter box currently means.
+       *
+       * The box doubles as the session-id field: after a pick it holds a full id.
+       * Filtering the list by that id would leave exactly one row on screen and
+       * make it look like the list broke, so an exact id match means "no filter".
+       */
+      function candidateFilter() {
+        var text = newMemberId.trim()
+        if (text.length === 0) return ''
+        var rows = Array.isArray(candidates.rows) ? candidates.rows : []
+        for (var index = 0; index < rows.length; index += 1) {
+          if (safeText(rows[index] === null ? '' : rows[index].id) === text) return ''
+        }
+        return text.toLowerCase()
+      }
+
+      /** The candidate rows worth drawing: usable records, filtered by the box. */
+      function visibleCandidates() {
+        var rows = (Array.isArray(candidates.rows) ? candidates.rows : []).filter(function (row) {
+          return row !== null && typeof row === 'object' && safeText(row.id).length > 0
+        })
+        var filter = candidateFilter()
+        if (filter.length === 0) return rows
+        return rows.filter(function (row) {
+          var haystack = (safeText(row.id) + ' ' + safeText(row.title) + ' ' + safeText(row.workspace) + ' ' + safeText(row.cwd)).toLowerCase()
+          return haystack.indexOf(filter) >= 0
+        })
+      }
+
+      /** Read the session list, if it is not already fresh. */
+      function openCandidates() {
+        // While a read is in flight, a second one adds nothing; within 15 s the
+        // answer is the same answer. Both are covered here so that typing into the
+        // filter box (which calls this on every keystroke) costs at most one read.
+        var fresh = candidates.open === true && (candidates.loading === true || Date.now() - candidates.at < 15000)
+        if (fresh) return
+        setCandidates(function (prev) {
+          return Object.assign({}, prev, { open: true, loading: true, error: '' })
+        })
+        loadSessions(state.group === null ? '' : state.group.id)
+          .then(function (data) {
+            if (!Array.isArray(data.sessions)) {
+              // C-01 again: "the host did not report a list" is not "there are no
+              // sessions". The two halves are served separately, so a reload can
+              // pair a new panel with a host that has not restarted yet — that is
+              // exactly when this happens, and it must say so.
+              setCandidates(function (prev) {
+                return Object.assign({}, prev, {
+                  open: true,
+                  loading: false,
+                  rows: [],
+                  error: '宿主没有报告会话列表（宿主可能还是旧版本，重启 DSH 后就会有）；仍然可以直接粘贴会话 id。',
+                  at: Date.now(),
+                })
+              })
+              return
+            }
+            var rows = data.sessions
+            setCandidates({
+              open: true,
+              loading: false,
+              error: '',
+              rows: rows,
+              total: countKnown(data.total) ? data.total : rows.length,
+              shown: countKnown(data.shown) ? data.shown : rows.length,
+              titlesStatus: safeText(data.titlesStatus),
+              untitled: countKnown(data.untitled) ? data.untitled : 0,
+              timeSource: safeText(data.timeSource),
+              timeError: safeText(data.timeError),
+              at: Date.now(),
+            })
+          })
+          .catch(function (error) {
+            setCandidates(function (prev) {
+              return Object.assign({}, prev, {
+                open: true,
+                loading: false,
+                rows: [],
+                error: '读不到会话列表：' + errorText(error) + '（仍然可以直接粘贴会话 id）',
+                at: Date.now(),
+              })
+            })
+          })
+      }
+
+      function closeCandidates() {
+        setCandidates(function (prev) {
+          if (prev.open !== true && prev.loading !== true) return prev
+          return Object.assign({}, prev, { open: false, loading: false })
+        })
+      }
+
+      /**
+       * Use one candidate: its id becomes the member id, and — only when the
+       * human has not typed a name — its title becomes the @ name.
+       */
+      function pickCandidate(row) {
+        var id = safeText(row === null || row === undefined ? '' : row.id)
+        if (id.length === 0) return
+        setNewMemberId(id)
+        if (newMemberName.trim().length === 0) setNewMemberName(freeMemberName(safeText(row.title)))
+        closeCandidates()
+      }
+
       function addMember() {
         var id = newMemberId.trim()
         if (id.length === 0 || state.group === null) return
@@ -1249,10 +1521,100 @@ window.__ModuleLoader__.load({
           .then(function () {
             setNewMemberId('')
             setNewMemberName('')
+            closeCandidates()
             setAdding(false)
             return again()
           })
           .catch(fail)
+      }
+
+      /**
+       * The picker itself: what the host said, in the human's words.
+       *
+       * Every branch exists because the alternative is a lie this panel has told
+       * before (c7): a failed read must not look like an empty list, a capped list
+       * must say it is capped, and a session whose activity time could not be read
+       * must say so instead of showing 「刚刚」.
+       */
+      function candidatePanel() {
+        if (candidates.open !== true) return null
+        var rows = visibleCandidates()
+        var notes = []
+        var head = '最近会话'
+        if (candidates.loading === true) {
+          head = '最近会话 · 正在读取…'
+        } else if (candidates.error === '') {
+          head = '最近会话 · 列出 ' + rows.length + ' 个'
+          if (countKnown(candidates.shown) && countKnown(candidates.total) && candidates.total > candidates.shown) {
+            notes.push('只显示最近 ' + candidates.shown + ' 个（这个部署共有 ' + candidates.total + ' 个会话）。')
+          }
+          if (candidates.timeSource !== '' && candidates.timeSource !== 'session-log-mtime') {
+            notes.push('活动时间读不到：' + str(candidates.timeError, '宿主没有给出原因') + '。')
+          }
+          if (candidates.titlesStatus !== '' && candidates.titlesStatus !== 'ok') {
+            notes.push('有会话的标题读不出来（宿主：' + candidates.titlesStatus + '）。')
+          } else if (countKnown(candidates.untitled) && candidates.untitled > 0) {
+            notes.push('有 ' + candidates.untitled + ' 个会话还没有标题，下面用「（无标题会话）」代替。')
+          }
+        }
+
+        var body = []
+        if (candidates.error !== '') {
+          body.push(h('div', { key: 'candidate-error', style: Object.assign({}, S.candidateNote, { opacity: 1 }) }, candidates.error))
+        } else if (candidates.loading === true) {
+          body.push(h('div', { key: 'candidate-loading', style: S.candidateNote }, '正在读取会话列表…'))
+        } else if (rows.length === 0) {
+          body.push(
+            h(
+              'div',
+              { key: 'candidate-empty', style: S.candidateNote },
+              (Array.isArray(candidates.rows) ? candidates.rows : []).length === 0
+                ? '这个部署里还没有会话记录，可以直接粘贴会话 id。'
+                : '没有匹配的会话；清空输入框可以看全部。',
+            ),
+          )
+        } else {
+          rows.forEach(function (row) {
+            var tags = []
+            if (row.live === true) tags.push(h('span', { key: 'live', style: S.tag }, '在线'))
+            if (row.member === true) tags.push(h('span', { key: 'member', style: S.tag }, '已在群里'))
+            if (row.subagent === true) tags.push(h('span', { key: 'subagent', style: S.tag }, '子会话'))
+            var cwd = safeText(row.cwd)
+            body.push(
+              h(
+                'button',
+                {
+                  key: safeText(row.id),
+                  style: S.candidateRow,
+                  title: safeText(row.id) + (cwd.length === 0 ? '' : '\n' + cwd),
+                  onClick: function () {
+                    pickCandidate(row)
+                  },
+                },
+                h(
+                  'span',
+                  { style: S.candidateTitle },
+                  candidateTitle(row),
+                  tags.length === 0 ? null : h('span', { style: { fontWeight: 400, marginLeft: '6px' } }, tags),
+                ),
+                h('span', { style: S.candidateMeta }, candidateWorkspace(row) + ' · 最后活动 ' + agoText(row.lastUsedAt)),
+              ),
+            )
+          })
+        }
+
+        return h(
+          'div',
+          { style: S.candidateBox },
+          h(
+            'div',
+            { style: S.candidateHead },
+            h('span', { style: S.candidateHeadText }, head),
+            h('button', { style: S.ghost, onClick: closeCandidates }, '收起'),
+          ),
+          notes.length === 0 ? null : h('div', { style: S.candidateNote }, notes.join(' ')),
+          h('div', { style: S.candidateScroll }, body),
+        )
       }
 
       if (state.loading) return h('div', { style: S.hint }, '正在读取群聊…')
@@ -2141,41 +2503,66 @@ window.__ModuleLoader__.load({
                   adding
                     ? h(
                         'div',
-                        { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' } },
-                        h('input', {
-                          style: S.input,
-                          value: newMemberId,
-                          placeholder: '会话 id，或 user / admin / bot 这类稳定 id',
-                          onChange: function (event) {
-                            setNewMemberId(event.target.value)
-                          },
-                          onKeyDown: function (event) {
-                            if (event.key === 'Enter') addMember()
-                          },
-                        }),
-                        h('input', {
-                          style: Object.assign({}, S.input, { flex: '0 0 130px' }),
-                          value: newMemberName,
-                          placeholder: '@用的名字',
-                          onChange: function (event) {
-                            setNewMemberName(event.target.value)
-                          },
-                        }),
+                        null,
                         h(
-                          'select',
-                          {
-                            style: S.small,
-                            value: newMemberKind,
+                          'div',
+                          { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' } },
+                          h('input', {
+                            style: S.input,
+                            value: newMemberId,
+                            // The whole request (2026-10-17): no more copying session
+                            // ids. Focusing the box opens the list of sessions with
+                            // their titles; typing narrows it.
+                            placeholder: '点这个框选一个会话，或直接粘贴会话 id',
+                            onFocus: openCandidates,
                             onChange: function (event) {
-                              setNewMemberKind(event.target.value)
+                              setNewMemberId(event.target.value)
+                              openCandidates()
                             },
-                          },
-                          (Array.isArray(knobs.memberKinds) ? knobs.memberKinds : []).map(function (kind) {
-                            return h('option', { key: kind, value: kind }, kind)
+                            onKeyDown: function (event) {
+                              if (event.key === 'Enter') addMember()
+                              if (event.key === 'Escape') closeCandidates()
+                            },
                           }),
+                          h(
+                            'button',
+                            {
+                              style: S.ghost,
+                              title: '列出最近用过的会话：标题、工作区、最后活动时间',
+                              onClick: openCandidates,
+                            },
+                            '选会话',
+                          ),
+                          h('input', {
+                            style: Object.assign({}, S.input, { flex: '0 0 130px' }),
+                            value: newMemberName,
+                            placeholder: '@用的名字',
+                            onChange: function (event) {
+                              setNewMemberName(event.target.value)
+                            },
+                          }),
+                          h(
+                            'select',
+                            {
+                              style: S.small,
+                              value: newMemberKind,
+                              onChange: function (event) {
+                                setNewMemberKind(event.target.value)
+                              },
+                            },
+                            (Array.isArray(knobs.memberKinds) ? knobs.memberKinds : []).map(function (kind) {
+                              return h('option', { key: kind, value: kind }, kind)
+                            }),
+                          ),
+                          h('button', { style: S.button, onClick: addMember }, '拉进来'),
+                          h('button', { style: S.ghost, onClick: function () { setAdding(false) } }, '取消'),
                         ),
-                        h('button', { style: S.button, onClick: addMember }, '拉进来'),
-                        h('button', { style: S.ghost, onClick: function () { setAdding(false) } }, '取消'),
+                        candidatePanel(),
+                        h(
+                          'div',
+                          { style: S.fieldHint },
+                          '选中一个会话会自动填上它的标题当名字，可以改；两个人同名时，@ 名字会同时叫醒两个人。',
+                        ),
                       )
                     : h(
                         'button',

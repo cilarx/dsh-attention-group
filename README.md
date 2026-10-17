@@ -145,9 +145,10 @@ pwsh -File tools/sync-plugin.ps1
 1. Sidebar → 「群聊」 → 「＋」 → name the room.
 2. Settings → turn 「唤醒」 on only when you actually want group messages to be able to start
    turns.
-3. Settings → add a member: paste a session id (`session-<uuid>` **or** a bare `<uuid>`) to make
-   it wakeable, or any stable id with kind `user` / `admin` / `bot` / `liaison` to make it a name
-   in the room.
+3. Settings → add a member: **click the id box** and a list of this machine's sessions appears
+   (title, workspace, last activity, most recent first) — click one and both the id and the
+   `@` name are filled in. Pasting an id (`session-<uuid>` **or** a bare `<uuid>`) still works,
+   and any stable id with kind `user` / `admin` / `bot` / `liaison` makes it a name in the room.
 4. Ask the agent in that session to call `attention_group_list`, then `attention_send` with
    `wake` left off — you get the plan, and nobody is disturbed.
 
@@ -416,6 +417,26 @@ anyone.
 「改为只记录」/「改为叫醒」, 「移除」, and a target picker), 「成员」 (per-member 「休眠」/「启用」,
 「移出」 with a confirm step, subscription terms, per-member effort), and 「这个群的记录在哪」.
 
+**Add members by clicking, not by copying ids.** After 「＋ 拉人进群」, click the id box (or press
+「选会话」) and the panel lists this machine's sessions with **title, workspace and last-activity
+time**, most recently active first. All three are needed, because sessions genuinely share or
+nearly share titles and the title alone cannot tell them apart. Clicking a row fills the session
+id, and — unless you already typed a name — fills the `@` name from the session's title (a name
+an existing member already answers to gets a suffix instead of a twin). Rows are tagged 「在线」
+(running) and 「已在群里」 (already in this room). Pasting an id still works: the picker is an
+extra path, never a replacement.
+
+> **Why the titles are not read out of the session logs.** Folding a title out of a session's
+> complete event log is what `sessionQuery.readTitleSnapshots` does, and measured on this machine
+> (2026-10-17) the 40 most recent logs total **67 MB** with a single log at 11 MB — one click
+> would decompress and replay tens of megabytes on the host's main thread and stall the whole
+> GUI. So titles come from DSH's **projection cache** (its own documentation calls this "the
+> zero-I/O listing read"; it is checkpointed at session creation, every `turn/end` and at
+> disposal), falling back to a predecessor checkpoint's title for a forked session. That order is
+> copied from DSH's own `dsh-api-session-controller`, not invented here. A session with no cached
+> title shows 「（无标题会话）」, and the panel says how many such rows there are — it never puts
+> an id where a title belongs.
+
 **The one click that can start a turn** is 「生成群史摘要」 (a direct request to the room's manager,
 never a scheduled job, and only while the room's 「唤醒」 switch is on). It reports what it actually
 did — 「已请求，等待群管理写回」 ("requested, waiting for the room manager to write back") — because
@@ -590,7 +611,7 @@ used instead of leaving you to guess:
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-Current state: **200/200 passing across the 10 suites** the script lists, both against the
+Current state: **226/226 passing across the 11 suites** the script lists, both against the
 installed copy and against a source tree with no DSH at all (measured on this machine on
 2026-10-17, about 7 seconds).
 
@@ -625,7 +646,7 @@ the history read, a session probe.
 byte changed, and it prints that check as its last line:
 
 ```
-38 passed, 0 failed
+40 passed, 0 failed
 YOUR DATA IS UNTOUCHED (…\attention-group hash 08c718998427…)
 ```
 
@@ -640,8 +661,9 @@ The suites are layered on purpose:
 |---|---|
 | `test/router.test.js` | Routing: who is worth waking, and that a plain message wakes nobody. |
 | `test/tools.test.js` | Tool contracts: schema-valid output, and `render` returning typed content blocks only. |
-| `test/panel-host.test.js` | The real web route: read model, every action, disk round-trips, permission refusals. |
+| `test/panel-host.test.js` | The real web route: read model, every action, disk round-trips, permission refusals, the invite picker. |
 | `test/panel-client.test.js` | The real `client.js` on a React stand-in: which control exists, what each click sends. |
+| `test/sessions.test.js` | Invite candidates: real titles/workspaces/activity times, and that no session log is read. |
 | `test/sink.test.js` | Conclusions on disk: append-only, never overwriting an export, the memory sentence's two branches. |
 | `test/digest.test.js` | Ranges (including the local-midnight boundary), bounding, and the one-turn summary hand-off. |
 | `test/relay.test.js` | Liaisons: A→B→A is refused, `maxHops` bounds a chain, nothing is woken by default. |

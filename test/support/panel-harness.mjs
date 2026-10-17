@@ -302,6 +302,17 @@ export async function mountPanel({ source, fetchImpl }) {
       press(node, key)
       panel.render()
     },
+    /**
+     * Focus a node, then re-render.
+     *
+     * Some controls do their whole job on focus rather than on click — the
+     * 「拉人」 session picker is one: focusing its box is what asks the host for
+     * the list. Without this a test could not reach that request at all.
+     */
+    focus(node) {
+      focus(node)
+      panel.render()
+    },
     /** The write payloads this panel sent, in order. */
     posts() {
       return requests.filter((row) => row.method === 'POST').map((row) => row.body)
@@ -337,4 +348,11 @@ export function press(node, key) {
   if (node === undefined) throw new Error('press() got no node')
   if (typeof node.props.onKeyDown !== 'function') throw new Error(`${node.type} has no onKeyDown`)
   node.props.onKeyDown({ key, preventDefault() {}, stopPropagation() {}, target: {} })
+}
+
+/** Focus a node, with the shape of a real React synthetic focus event. */
+export function focus(node) {
+  if (node === undefined) throw new Error('focus() got no node')
+  if (typeof node.props.onFocus !== 'function') throw new Error(`${node.type} has no onFocus`)
+  node.props.onFocus({ preventDefault() {}, stopPropagation() {}, target: {} })
 }

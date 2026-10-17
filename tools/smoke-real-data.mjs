@@ -24,6 +24,7 @@ import { createHash } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 
 const args = new Set(process.argv.slice(2))
 const profileRoot = join(process.env.USERPROFILE ?? homedir(), '.dsh', 'profiles', 'desktop')
@@ -277,6 +278,38 @@ const auditLines = existsSync(auditFile)
   ? readFileSync(auditFile, 'utf8').trim().split('\n').filter((line) => line.length > 0)
   : []
 console.log(`  note  ${auditLines.length} delivery record(s) — every attempt, delivered or not`)
+
+// ---------------------------------------------------------------------------
+section('the panel\'s 「拉人」 picker')
+// ---------------------------------------------------------------------------
+/** Drive the panel route exactly the way the browser does, and parse the answer. */
+async function panelGet(url) {
+  return new Promise((resolve, reject) => {
+    const req = Readable.from([Buffer.from('')])
+    req.method = 'GET'
+    req.url = url
+    let text = ''
+    const res = {
+      writeHead() {},
+      end(chunk) {
+        if (chunk !== undefined) text += String(chunk)
+        try {
+          resolve(JSON.parse(text))
+        } catch (error) {
+          reject(error)
+        }
+      },
+    }
+    Promise.resolve(routes[0].handler(req, res)).catch(reject)
+  })
+}
+// This smoke context is the thinnest possible deployment: no `sessionQuery`. That
+// is exactly the case that must DEGRADE HONESTLY — the picker may not answer
+// 「没有会话」 for a deployment that simply cannot list sessions (c7).
+const picker = await panelGet('/attention-group?candidates=1')
+check(picker.ok === false && /sessionQuery/.test(String(picker.error)), 'without sessionQuery the picker refuses, naming the missing service')
+const plainPanel = await panelGet('/attention-group')
+check(plainPanel.ok === true && Array.isArray(plainPanel.groups), 'and the ordinary panel read still returns the room list')
 
 // ---------------------------------------------------------------------------
 section('the ledger survived')

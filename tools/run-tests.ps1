@@ -53,6 +53,7 @@ $files = @(
   'test/panel-client.test.js'
   'test/panel-fixes.test.js'
   'test/panel-host.test.js'
+  'test/sessions.test.js'
   'test/sink.test.js'
   'test/digest.test.js'
   'test/relay.test.js'

@@ -148,13 +148,82 @@ const DETAIL = {
 }
 
 /**
+ * A host standing behind the 「拉人」 picker: sessions to choose from.
+ *
+ * Deliberately mixed, because the picker exists to survive every one of these
+ * shapes at once: a titled live session that is already a member, a titled
+ * session from another workspace, a session with NO title and no activity time,
+ * and a title that collides with an existing member's name.
+ */
+const CANDIDATES = {
+  ok: true,
+  total: 5,
+  shown: 4,
+  max: 40,
+  sessions: [
+    {
+      id: JIA,
+      title: '甲的工作会话',
+      workspace: 'DSH默认',
+      cwd: 'J:\\work',
+      lastUsedAt: new Date(Date.now() - 3 * 60 * 1000).toISOString(),
+      live: true,
+      subagent: false,
+      preset: '',
+      member: true,
+    },
+    {
+      id: 'session-bbbb1111-2222-3333-4444-555566667777',
+      title: '测试群',
+      workspace: 'DS Bot',
+      cwd: 'C:\\Users\\test\\.dsh\\bot-workspace',
+      lastUsedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      live: false,
+      subagent: false,
+      preset: '',
+      member: false,
+    },
+    {
+      id: 'session-cccc1111-2222-3333-4444-555566667777',
+      title: '',
+      workspace: '',
+      cwd: '',
+      lastUsedAt: '',
+      live: false,
+      subagent: true,
+      preset: '',
+      member: false,
+    },
+    {
+      id: 'session-dddd1111-2222-3333-4444-555566667777',
+      title: '甲',
+      workspace: 'DSH默认',
+      cwd: 'J:\\work',
+      lastUsedAt: '',
+      live: false,
+      subagent: false,
+      preset: '',
+      member: false,
+    },
+  ],
+  timeSource: 'session-log-mtime',
+  titlesStatus: 'ok',
+  // One row below has no title yet — a healthy absence the panel states once,
+  // instead of alarming the human about a failure that did not happen.
+  untitled: 1,
+  workspacesStatus: 'ok',
+}
+
+/**
  * A host stand-in: GET returns the fixture, POST is accepted and recorded.
  *
- * @param {object} [options] - `{fail}` makes every read fail.
+ * @param {object} [options] - `{fail}` makes every read fail; `candidatesFail`
+ *   makes only the picker's list fail; `candidatesMissing` makes the host answer
+ *   the picker without a session list (a host older than this panel).
  * @returns {Function} a fetch implementation.
  */
 function fakeHost(options = {}) {
-  const { fail } = options
+  const { fail, candidatesFail, candidatesMissing } = options
   return (record) => {
     if (record.method === 'POST') {
       const body = record.body ?? {}
@@ -176,6 +245,18 @@ function fakeHost(options = {}) {
             ...extra,
           }),
       })
+    }
+    if (/[?&]candidates=1/u.test(record.url)) {
+      if (candidatesFail !== undefined) {
+        return Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({ ok: false, error: candidatesFail }) })
+      }
+      if (candidatesMissing === true) {
+        // A host that does not know this query parameter still answers 200 — with
+        // the ordinary room list and no `sessions` field. That is the exact shape
+        // of "the panel was reloaded before DSH restarted".
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, groups: GROUPS }) })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(CANDIDATES) })
     }
     if (fail !== undefined) {
       return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ ok: false, error: fail }) })
@@ -248,6 +329,44 @@ async function openSettings() {
   panel.click(findButton(panel.tree, 'P群'))
   await panel.settle()
   panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  return panel
+}
+
+/** An input, found by the text of its placeholder. */
+function inputByPlaceholder(tree, needle) {
+  return findAll(tree, (node) => {
+    const placeholder = node?.props?.placeholder
+    return node.type === 'input' && typeof placeholder === 'string' && placeholder.includes(needle)
+  })[0]
+}
+
+/**
+ * One candidate row, addressed by the session id it carries in its tooltip.
+ *
+ * Matching on visible text would be ambiguous by construction — the whole reason
+ * this picker exists is that two sessions can carry similar titles.
+ */
+function candidateRow(tree, sessionId) {
+  return findAll(tree, (node) => {
+    if (node.type !== 'button') return false
+    const tooltip = node.props.title
+    return typeof tooltip === 'string' && tooltip.split('\n')[0] === sessionId
+  })[0]
+}
+
+/** Open the P room, start the 拉人 form, and open the session picker. */
+async function openPicker(options = {}) {
+  const panel = await boot(options)
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  panel.click(findButton(panel.tree, '＋ 拉人进群'))
+  await panel.settle()
+  const input = inputByPlaceholder(panel.tree, '选一个会话')
+  assert.ok(input !== undefined, 'the id box must say that it opens a picker')
+  panel.focus(input)
   await panel.settle()
   return panel
 }
@@ -779,4 +898,135 @@ test('a theme token is only used where its VALUE fits the role', () => {
   assert.deepEqual(unvetted, [], `unvetted theme token(s): ${unvetted.join(', ')}`)
   // And the accent must still be a colour, not a token that might resolve to white.
   assert.ok(SOURCE.includes('#4d6bfe'), 'the brand accent must stay a literal colour')
+})
+
+// ---------------------------------------------------------------------------
+// The 「拉人」 picker (2026-10-17, user request).
+//
+// The request was concrete: inviting an agent must not require typing or copying
+// a 36-character session id, and a list of TITLES is not enough on its own —
+// "真的会有同名或者类似名的会话" — so each row also has to say which workspace it
+// belongs to and when it last did anything.
+// ---------------------------------------------------------------------------
+
+test('the session catalogue is not read until somebody opens the picker', async () => {
+  // A cost rule, not a style preference: building that list makes the host read
+  // one session log per row for its title. Doing it on panel mount would make an
+  // idle panel work for a list nobody is looking at.
+  const panel = await boot()
+  assert.equal(panel.requests.filter((row) => row.url.includes('candidates=1')).length, 0)
+})
+
+test('focusing the id box lists sessions with title, workspace and last activity', async () => {
+  const panel = await openPicker()
+  const shown = textOf(panel.tree)
+  assert.match(shown, /最近会话/)
+  assert.match(shown, /列出 4 个/)
+  // Titles.
+  assert.match(shown, /甲的工作会话/)
+  assert.match(shown, /测试群/)
+  // Workspaces — the tie-breaker the user asked for, because titles repeat.
+  assert.match(shown, /DSH默认/)
+  assert.match(shown, /DS Bot/)
+  // When each last did anything. Relative while recent, a date when stale…
+  assert.match(shown, /最后活动 \d+ 分钟前/u)
+  assert.match(shown, /最后活动 2 小时前/u)
+  // …and an absent timestamp says it is absent instead of showing a made-up time.
+  assert.match(shown, /活动时间未知/)
+  // A session without a title is not shown under its id, which would defeat the
+  // entire point of the picker.
+  assert.match(shown, /（无标题会话）/)
+  assert.match(shown, /工作区未知/)
+  assert.match(shown, /还没有标题/, 'the absence of a title is stated once, as a fact rather than a failure')
+  // Tags that keep two similar rows apart.
+  assert.match(shown, /在线/)
+  assert.match(shown, /已在群里/)
+  assert.match(shown, /子会话/)
+  // A capped list must say it is capped: the fixture reports 5 total, 4 shown.
+  assert.match(shown, /只显示最近 4 个/)
+
+  const asked = panel.requests.filter((row) => row.method === 'GET').map((row) => row.url)
+  assert.ok(
+    asked.some((url) => url.includes('candidates=1')),
+    `the picker must ask the host for candidates; asked: ${asked.join(', ')}`,
+  )
+  assert.ok(
+    asked.some((url) => url.includes('candidates=1') && url.includes(`group=${P_ID}`)),
+    'and must name the room, so the host can mark 「已在群里」',
+  )
+})
+
+test('picking a session fills its id and a fresh @ name, then closes the list', async () => {
+  const panel = await openPicker()
+  panel.click(candidateRow(panel.tree, JIA))
+  await panel.settle()
+
+  assert.equal(inputByPlaceholder(panel.tree, '选一个会话').props.value, JIA)
+  assert.equal(inputByPlaceholder(panel.tree, '@用的名字').props.value, '甲的工作会话')
+  assert.doesNotMatch(textOf(panel.tree), /最近会话/, 'choosing one row ends the list')
+})
+
+test('a title that already answers to a member gets a suffix, not a twin', async () => {
+  // A room addresses people by NAME. Pre-filling a title another member already
+  // uses would mean one `@名字` wakes both — exactly the surprise this picker is
+  // meant to remove, so the panel must not create it on the human's behalf.
+  const panel = await openPicker()
+  panel.click(candidateRow(panel.tree, 'session-dddd1111-2222-3333-4444-555566667777'))
+  await panel.settle()
+  const name = inputByPlaceholder(panel.tree, '@用的名字').props.value
+  assert.equal(name, '甲 2', `expected 「甲 2」 and got 「${name}」`)
+})
+
+test('a name the human typed is not overwritten by a pick', async () => {
+  const panel = await openPicker()
+  panel.change(inputByPlaceholder(panel.tree, '@用的名字'), '我的名字')
+  panel.click(candidateRow(panel.tree, JIA))
+  await panel.settle()
+  assert.equal(inputByPlaceholder(panel.tree, '@用的名字').props.value, '我的名字')
+})
+
+test('typing narrows the list locally, without re-reading the catalogue', async () => {
+  const panel = await openPicker()
+  const readsBefore = panel.requests.filter((row) => row.url.includes('candidates=1')).length
+  panel.change(inputByPlaceholder(panel.tree, '选一个会话'), '测试')
+  await panel.settle()
+  const shown = textOf(panel.tree)
+  assert.match(shown, /测试群/)
+  assert.doesNotMatch(shown, /甲的工作会话/, 'the filter must actually filter')
+  const readsAfter = panel.requests.filter((row) => row.url.includes('candidates=1')).length
+  assert.equal(readsAfter, readsBefore, 'filtering is local; it must not ask the host again')
+})
+
+test('a failed session list is a failure, not an empty list', async () => {
+  const panel = await openPicker({ candidatesFail: '索引生成过期' })
+  const shown = textOf(panel.tree)
+  assert.match(shown, /读不到会话列表/)
+  assert.match(shown, /索引生成过期/, "the host's own reason must reach the human")
+  assert.match(shown, /粘贴会话 id/, 'and the fallback that still works must be named')
+  assert.doesNotMatch(shown, /这个部署里还没有会话记录/, 'failure must never render as "there is nothing"')
+})
+
+test('a host that does not know the picker is reported as a pending restart', async () => {
+  // The two halves are served separately, so a page reload can pair a new panel
+  // with a host that has not been restarted. That host answers 200 with the
+  // ordinary room list and no `sessions` field — which must not read as "no
+  // sessions exist".
+  const panel = await openPicker({ candidatesMissing: true })
+  const shown = textOf(panel.tree)
+  assert.match(shown, /宿主没有报告会话列表/)
+  assert.match(shown, /重启 DSH/)
+  assert.doesNotMatch(shown, /这个部署里还没有会话记录/)
+})
+
+test('the box still takes a pasted id, and 拉进来 still sends it', async () => {
+  // The picker is an addition, never a replacement: a person who already knows
+  // the id must not have to fight the list.
+  const panel = await openSettings()
+  panel.click(findButton(panel.tree, '＋ 拉人进群'))
+  await panel.settle()
+  panel.change(inputByPlaceholder(panel.tree, '选一个会话'), 'session-9999')
+  await panel.settle()
+  panel.click(findButton(panel.tree, '拉进来'))
+  await panel.settle()
+  assert.deepEqual(panel.lastPost(), { action: 'join', group: P_ID, memberId: 'session-9999', kind: 'session' })
 })
