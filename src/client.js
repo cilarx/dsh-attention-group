@@ -1767,6 +1767,23 @@ window.__ModuleLoader__.load({
               h(
                 Field,
                 {
+                  label: '未读写进系统提示',
+                  value: tri(group.promptUnread),
+                  hint:
+                    '开：成员每次被跑起来（哪怕是因为别的事）都会在自己的系统提示里看到一行「群聊未读：…」，' +
+                    '所以掉线期间的消息不会因为"没人叫醒它"而被无视。只报条数，不把消息正文塞进去；' +
+                    '这是每一步都会带一行的开销，所以默认关。',
+                },
+                h(Switch, {
+                  value: group.promptUnread,
+                  onPick: function (value) {
+                    setKnob('promptUnread', { promptUnread: value })
+                  },
+                }),
+              ),
+              h(
+                Field,
+                {
                   label: '群用途及群规',
                   hint:
                     '成员被叫醒时会在消息里看到这段。先写清「这个群是干什么的」，再写规矩 —— ' +

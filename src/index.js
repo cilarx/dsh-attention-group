@@ -402,6 +402,123 @@ function countUnread(root, groupId, member, excludeSeq) {
 }
 
 /**
+ * How long a computed unread count may be reused before it is recomputed.
+ *
+ * ⚠️ This exists because the prompt line below runs on EVERY step of EVERY agent.
+ * `countUnread` reads the room's whole JSONL, so asking it per step would turn a
+ * long-lived room into a per-step disk scan — exactly the "the group got big and
+ * now everything is slow" failure. Five seconds is short enough that a member
+ * never misses a fresh message for long, and long enough that a step costs one
+ * `Map` lookup. The cache key carries `lastReadAt`, so reading the room also
+ * invalidates it immediately.
+ */
+const UNREAD_PROMPT_CACHE_MS = 5000
+
+/**
+ * The one line a member agent sees about its unread rooms.
+ *
+ * This is the R6 upgrade: "offline members do not miss messages" used to mean
+ * "we tell you when we wake you". A member that gets started for some other
+ * reason had no idea the room had three messages waiting. The runtime-context
+ * channel survives compaction, so this line is re-projected into every later
+ * step by the harness itself.
+ *
+ * Rules it follows:
+ *   - only rooms that opted in (`promptUnread`), only for members of that room;
+ *   - nothing at all when there is nothing to say (the quiet default matters:
+ *     this plugin's whole claim is that it shuts up);
+ *   - `undefined` from `countUnread` means "never read this room" — the line says
+ *     "有未读" instead of inventing a number (c7: no false precision);
+ *   - capped to three rooms so the line cannot grow with the number of rooms.
+ *
+ * @param {object} state - plugin state.
+ * @param {string} sessionId - the session whose prompt is being assembled.
+ * @returns {string} one Chinese line, or '' when there is nothing to say.
+ */
+function unreadPromptLine(state, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return ''
+  const groups = state.ledger?.groups
+  if (!Array.isArray(groups)) return ''
+  const cache = state.unreadPromptCache ?? (state.unreadPromptCache = new Map())
+  const now = Date.now()
+  const parts = []
+  for (const group of groups) {
+    if (group?.promptUnread !== true) continue
+    const member = safeMembers(group).find((row) => row?.id === sessionId)
+    if (member === undefined || member.enabled === false) continue
+    const readMark = typeof member.lastReadAt === 'string' ? member.lastReadAt : ''
+    const key = `${group.id}\u0000${sessionId}`
+    const hit = cache.get(key)
+    let count
+    if (hit !== undefined && hit.readMark === readMark && now - hit.at < UNREAD_PROMPT_CACHE_MS) {
+      count = hit.count
+    } else {
+      try {
+        count = countUnread(state.root, group.id, member)
+      } catch {
+        // A room whose transcript cannot be read is "unknown", never "empty".
+        count = undefined
+      }
+      cache.set(key, { at: now, readMark, count })
+    }
+    if (count === 0) continue
+    parts.push(`「${singleLine(group.title, 40) || '(untitled)'}」${count === undefined ? '有未读' : `${count} 条`}`)
+    if (parts.length >= 3) break
+  }
+  if (parts.length === 0) return ''
+  return `群聊未读：${parts.join('、')}。用 attention_history 读，attention_send 回复。`
+}
+
+/**
+ * Publish the unread line as a runtime prompt context.
+ *
+ * `ctx.inject` because `systemPrompt` is not in this plugin's own scope (c8), and
+ * `scope.effect` because the child fiber can activate more than once — the effect
+ * disposes the previous registration first, so this is idempotent (c23).
+ *
+ * @param {object} ctx - Cordis context.
+ * @param {object} state - plugin state.
+ */
+function registerPromptContext(ctx, state) {
+  if (typeof ctx.inject !== 'function') {
+    state.promptStatus = 'ctx.inject is unavailable'
+    return
+  }
+  try {
+    ctx.inject(['systemPrompt'], (scope) => {
+      const prompt = scope.systemPrompt
+      if (prompt === undefined || prompt === null || typeof prompt.context !== 'function') {
+        state.promptStatus = 'systemPrompt child context carried no service'
+        return
+      }
+      scope.effect(() => {
+        const dispose = prompt.context({
+          name: 'attention-group-unread',
+          // After the task-memory context (order 900): memory is background, this
+          // is a "there is something waiting for you" nudge and reads better last.
+          order: 901,
+          text: (assembly) => {
+            try {
+              return unreadPromptLine(state, assembly?.agent?.session?.id)
+            } catch {
+              // A diagnostic-grade failure must not break the model step.
+              return ''
+            }
+          },
+        })
+        state.promptStatus = 'registered'
+        return () => {
+          state.promptStatus = 'disposed'
+          if (typeof dispose === 'function') dispose()
+        }
+      }, 'attention-group: unread prompt context')
+    })
+  } catch (error) {
+    state.promptStatus = `inject failed: ${errorMessage(error)}`
+  }
+}
+
+/**
  * The next sequence number for a room: one past the highest number ever used.
  *
  * ⚠️ NOT `messages.length + 1`. Sequence numbers are the room's ordering, and a
@@ -1186,6 +1303,22 @@ function registerTools(ctx, state) {
               properties: {
                 path: { type: 'string', required: true },
                 status: { type: 'string', required: true },
+                // How many times the inject child fiber activated the route. >1 is
+                // normal; it is published so a re-activation is a fact, not a
+                // mystery. Optional: older hosts never set it.
+                activations: { type: 'number' },
+              },
+            },
+            // R6: whether the unread line can reach a member's prompt at all, and
+            // how many rooms opted in. Same rule as the route above — a capability
+            // that is silently unavailable has to say so (c7 ②).
+            promptContext: {
+              type: 'object',
+              required: true,
+              additionalProperties: false,
+              properties: {
+                status: { type: 'string', required: true },
+                rooms: { type: 'number', required: true },
               },
             },
             // U3's answer, reported here because "the effort switch did nothing to
@@ -1238,6 +1371,9 @@ function registerTools(ctx, state) {
           // Why the panel is or is not reachable. Without this line a missing
           // panel reads as "you have no groups yet".
           lines.push(`panel route: ${value.panelRoute.path} -> ${value.panelRoute.status}`)
+          lines.push(
+            `unread-in-prompt: ${value.promptContext.status}${value.promptContext.rooms > 0 ? ` (${value.promptContext.rooms} room(s) opted in)` : ''}`,
+          )
           if (value.orphanedTranscripts.length > 0) {
             lines.push(
               `transcripts on disk that the ledger does not list: ${value.orphanedTranscripts.length} — the messages still exist, only the room entry is missing (${value.orphanedTranscripts.slice(0, 5).join(', ')}${value.orphanedTranscripts.length > 5 ? ', …' : ''})`,
@@ -1294,6 +1430,13 @@ function registerTools(ctx, state) {
             // normal (a dependency can be re-composed); the registration is
             // idempotent, so the last activation owns the live route.
             ...(state.routeAttempts > 0 ? { activations: state.routeAttempts } : {}),
+          },
+          // R6: whether the unread line can reach a member's prompt at all. A
+          // deployment without `systemPrompt` degrades to "the panel still shows
+          // unread, the agent just is not told" — and this line says so.
+          promptContext: {
+            status: typeof state.promptStatus === 'string' ? state.promptStatus : 'not attempted',
+            rooms: state.ledger.groups.filter((group) => group.promptUnread === true).length,
           },
           // The one caller of `transcriptGroupIds`. A transcript whose room is not
           // in the ledger is history the user still has: after a corrupt-ledger
@@ -2860,6 +3003,9 @@ function panelGroupDetail(state, group) {
     sinkEnabled: group.sinkEnabled !== false,
     sinkDir: typeof group.sinkDir === 'string' ? group.sinkDir : '',
     sinkMemory: group.sinkMemory === true,
+    // R6: when this is on, a member sees "群聊未读：…" in its own system prompt on
+    // every step, so it learns about waiting messages even when nobody woke it.
+    promptUnread: group.promptUnread === true,
     // R10: where this room relays to, and what each link is willing to carry.
     links: linkSummary(group).routes,
     sink: {
@@ -3111,6 +3257,12 @@ async function applyPanelAction(state, body) {
     return done({ selfReflect: group.selfReflect })
   }
 
+  if (action === 'promptUnread') {
+    group.promptUnread = body?.promptUnread === true
+    save()
+    return done({ promptUnread: group.promptUnread })
+  }
+
   if (action === 'joinPolicy') {
     const legal = PANEL_KNOBS.joinPolicies.map((row) => row.value)
     const policy = String(body?.joinPolicy ?? '')
@@ -3327,6 +3479,7 @@ function apply(ctx) {
   }
   registerTools(ctx, state)
   registerWebRoute(ctx, state)
+  registerPromptContext(ctx, state)
   registerSessionController(ctx, state)
 }
 

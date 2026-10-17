@@ -66,6 +66,31 @@ test('a re-activated child fiber re-registers the route instead of failing on a 
   assert.equal(response.json.ok, true)
 })
 
+test('an opted-in room announces its unread count in the member prompt, and only to members', async () => {
+  // R6's missing half: a member that gets started for some OTHER reason used to
+  // have no idea the room had messages waiting. The runtime prompt context is the
+  // only channel that survives compaction, so this is where it belongs.
+  boot()
+  const groupId = await newRoom('未读提示群')
+  const memberId = 'session-7777aaaa-8888-9999-aaaa-bbbbccccdddd'
+  await post({ action: 'join', group: groupId, memberId, memberName: '成员甲' })
+  await post({ action: 'post', group: groupId, text: '有人吗' })
+
+  const lineFor = (id) =>
+    host.promptContexts
+      .map((row) => (typeof row.text === 'function' ? row.text({ agent: { session: { id } } }) : row.text))
+      .join('\n')
+
+  assert.equal(lineFor(memberId), '', 'the default stays quiet: no per-step prompt noise')
+  await post({ action: 'promptUnread', group: groupId, promptUnread: true })
+  assert.match(lineFor(memberId), /群聊未读/)
+  assert.match(lineFor(memberId), /未读提示群/)
+  assert.equal(lineFor('session-00000000-0000-0000-0000-000000000000'), '', 'a non-member is never told')
+  // A switch that can only be turned ON is not a switch.
+  await post({ action: 'promptUnread', group: groupId, promptUnread: false })
+  assert.equal(lineFor(memberId), '')
+})
+
 test('one GET returns the room list, per-room unread, and the knob table', async () => {
   boot()
   const groupId = await newRoom('读模型群')

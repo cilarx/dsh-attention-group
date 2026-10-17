@@ -69,6 +69,9 @@ export async function createHost(options = {}) {
   // Every `ctx.inject` callback, kept so a test can re-activate the child fiber
   // the way Cordis does when a dependency is re-composed.
   let injects = []
+  // Every runtime prompt context the plugin published. A test drives it exactly
+  // the way the harness does: `definition.text({ agent: { session: { id } } })`.
+  let promptContexts = []
 
   // The deployment's real `webServer` face, hoisted out of `reboot()` so that
   // `reactivate()` can hand the SAME service object back to the child fiber.
@@ -103,6 +106,7 @@ export async function createHost(options = {}) {
     // disposers: the old route is gone before the new apply runs.
     registrations = []
     injects = []
+    promptContexts = []
     tools = new Map()
     for (const name of extraTools) {
       tools.set(name, {
@@ -162,6 +166,24 @@ export async function createHost(options = {}) {
         if (names.includes('webServer')) {
           injects.push(cb)
           cb({ webServer })
+        }
+        if (names.includes('systemPrompt')) {
+          // The real child scope has `effect`; a stub that runs the callback and
+          // returns its disposer is enough to prove registration and release.
+          cb({
+            systemPrompt: {
+              context(definition) {
+                promptContexts.push(definition)
+                return () => {
+                  const index = promptContexts.indexOf(definition)
+                  if (index >= 0) promptContexts.splice(index, 1)
+                }
+              },
+            },
+            effect(callback) {
+              return callback()
+            },
+          })
         }
         // A deployment without `sessionController` never calls back at all — which
         // is what a headless tree looks like, and the state most tests should be
@@ -265,6 +287,10 @@ export async function createHost(options = {}) {
     /** How many route registrations are live right now (must never exceed 1). */
     get routeCount() {
       return registrations.length
+    },
+    /** Runtime prompt contexts the plugin published, in registration order. */
+    get promptContexts() {
+      return promptContexts
     },
     tool(name) {
       return tools.get(name)
