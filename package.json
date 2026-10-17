@@ -4,6 +4,14 @@
   "description": "A multi-agent group chat for DSH that decides who is worth waking: durable message log, attention routing, and cross-workspace membership.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cilarx/dsh-attention-group.git"
+  },
+  "homepage": "https://github.com/cilarx/dsh-attention-group#readme",
+  "bugs": {
+    "url": "https://github.com/cilarx/dsh-attention-group/issues"
+  },
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",

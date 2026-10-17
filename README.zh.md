@@ -44,26 +44,33 @@ routing: 1 recipient(s) — plan only, nothing woken
 - DSH **0.2.0-rc.2**（这里每一个接口都是对着这个版本核实的）。
 - 一个可以装进去的 profile。下文示例用 `--profile desktop`。
 
-### 这个包还没有发布到 npm
-
-写作本文时**没有已发布的 npm 包**（以后是否会变，`unverified`）。所以
-`dsh plugin --profile desktop add dsh-attention-group` 只有在它**已经发布或已经打包之后**才可用；
-今天你只能按路径从这份源码目录安装。等某个版本真的上了 npm，用裸包名的同一条命令就是预期路径
-（在真的发生之前，这一条是 `unverified`）。
-
 ### 安装
 
-从源码目录（也就是含本 `package.json` 的那个目录）安装：
-
 ```bash
-dsh plugin --profile desktop add "J:\路径\到\dsh-attention-group"
+dsh plugin --profile desktop add github:cilarx/dsh-attention-group
 ```
+
+这就是全部。**2026-10-17 从一个干净 profile 端到端实测过**：命令退出码 0，DSH 自动初始化 profile，
+装出来的包里 7 个源文件、bundle patch、`cordis.patch.yml` 全在。
+
+裸包名那一条（`dsh plugin --profile desktop add dsh-attention-group`）**现在还解析不了**，因为
+没有 npm 发布。请用上面的 `github:` 形式。
 
 目录路径、tarball、git URL 都行，因为 `dsh plugin` **本身就是**包管理：它在 profile 目录里把命令
 交给 `pnpm`（不带子命令跑一次 `dsh plugin --profile <名字>`，回给你的就是 pnpm 自己的帮助）。让它
 成为插件的，是 `package.json` 里声明了 `dsh.bundle.patch`。
 
-tarball 安装已端到端实测：
+新 profile 会被**自动写好契约的两半** —— 依赖 **和** bundle 层。正是这两半才让插件真的被加载，
+而不只是"被装上"：
+
+```json
+{ "dependencies": { "dsh-attention-group": "github:cilarx/dsh-attention-group" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-attention-group"] } } }
+```
+
+### 离线 / 从本地源码装
+
+按路径装也可以，打包成 tarball 装也已端到端实测：
 
 ```bash
 npm pack --pack-destination /tmp
@@ -384,8 +391,19 @@ pwsh -File tools/run-tests.ps1
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-当前状态：脚本里列的 **8 个套件 111/111 通过** —— 无论对着已安装副本、还是对着一份**完全没有 DSH**
-的源码树（本机 2026-10-16 实测，约 4 秒）。
+当前状态：脚本里列的 **10 个套件 184/184 通过** —— 无论对着已安装副本、还是对着一份**完全没有 DSH**
+的源码树（本机 2026-10-17 实测，约 7 秒）。
+
+### 它是怎么被测的
+
+大部分代码写完之后，我请三个独立的审计员来打它，这一轮非常值。三个人分工：一个用约一千组恶意参数
+找崩溃；一个找"不崩但结果错"（导出竞态、防环、时区边界）；一个找面板上的谎报。他们找出 **31 个真
+问题**，其中一个还在**我自己写的测试里** —— 那条测试把 bug 断言成了正确契约。
+
+最贵的那个值得写在这里，因为它从外面完全看不见：`@提及` 的边界用的是 `\w`，而 `\w` 就是
+`[A-Za-z0-9_]`，**一个汉字都不算**。群里有 `小明` 和 `小明明` 时，一条只点了一个人的消息会把
+**两个都叫醒** —— 用两个 live 会话实测过。而"叫醒错的人"正是这个插件存在的全部理由。
+现在边界用 Unicode 属性类，回归测试断言的是**路由层的后果**，不只是正则本身。
 
 ### 拿你自己的数据做冒烟测试
 

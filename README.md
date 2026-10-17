@@ -47,28 +47,36 @@ Three consequences that are design rules here, not accidents:
 - DSH **0.2.0-rc.2** (this is the version every interface here was verified against).
 - A profile to install into. The examples below use `--profile desktop`.
 
-### This package is not on npm yet
-
-There is **no published npm package** as of this writing (`unverified` whether that
-changes). So `dsh plugin --profile desktop add dsh-attention-group` will work only **after**
-it is published or packed; today you install it from this checkout by path. Once a version
-is on npm, the same command with the bare package name is the intended path
-(`unverified` until it actually is).
-
 ### Install
 
-Install from the checkout directory (the path containing this `package.json`):
-
 ```bash
-dsh plugin --profile desktop add "J:\path\to\dsh-attention-group"
+dsh plugin --profile desktop add github:cilarx/dsh-attention-group
 ```
+
+That is the whole install. It was **verified end to end from a clean profile** on 2026-10-17:
+the command exits 0, DSH initializes the profile, and the package lands with all seven
+source files, its bundle patch and its `cordis.patch.yml`.
+
+The bare-name form `dsh plugin --profile desktop add dsh-attention-group` does **not** resolve
+yet, because there is no npm release. Use the `github:` form above.
 
 Any of a directory path, a tarball, or a git URL works, because `dsh plugin` **is** package
 management: it delegates to `pnpm` in the profile directory (run `dsh plugin --profile <name>`
 with no subcommand and pnpm's own help comes back). What makes the package a *plugin* is that
 `package.json` declares `dsh.bundle.patch`.
 
-A tarball install is verified end to end:
+A fresh profile gets **both halves** of the contract written for it automatically — the
+dependency *and* the bundle layer — which is what makes the plugin actually load rather than
+merely be installed:
+
+```json
+{ "dependencies": { "dsh-attention-group": "github:cilarx/dsh-attention-group" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-attention-group"] } } }
+```
+
+### Offline / from a checkout
+
+Installing by path works too, and a packed tarball is verified end to end:
 
 ```bash
 npm pack --pack-destination /tmp
@@ -426,9 +434,24 @@ used instead of leaving you to guess:
 note: no profile at ~/.dsh/profiles/desktop - skipping the sync and testing this source tree
 ```
 
-Current state: **111/111 passing across the 8 suites** the script lists, both against the
+Current state: **184/184 passing across the 10 suites** the script lists, both against the
 installed copy and against a source tree with no DSH at all (measured on this machine on
-2026-10-16, about 4 seconds).
+2026-10-17, about 7 seconds).
+
+### How this was tested
+
+Most of it was written before an adversarial audit, and that audit earned its keep. Three
+independent readers were pointed at the plugin — one hunting crashes with about a thousand
+hostile argument sets, one hunting silent wrongness (export races, loop guards, timezone
+edges), one hunting panel dishonesty — and they found **31 real problems**, including one in
+a test of mine that had enshrined a bug as a contract.
+
+The most expensive one is worth repeating here because it is invisible from the outside:
+`@mention` boundaries used `\w`, which is `[A-Za-z0-9_]` and contains no CJK character. A room
+holding both `小明` and `小明明` woke **both** from a message naming one of them — measured with
+two live sessions. Waking the wrong agent is precisely the cost this plugin exists to remove.
+Boundaries are now Unicode property escapes, and the regression test asserts the routed
+consequence, not just the regex.
 
 ### Smoke test against your own data
 
