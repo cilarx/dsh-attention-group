@@ -13,42 +13,49 @@
  *
  * ⚠️ THE DATA HERE IS FOREIGN. Everything else in this plugin reads its OWN
  * ledger under `$DSH_HOME/attention-group`; this reads the deployment's session
- * catalogue through DSH's own services. So every field is treated as untrusted
- * and DEFAULTED rather than passed through: one malformed session record may
- * cost that one row, never the whole list. A picker that throws is worse than no
- * picker, because the panel then has nothing to show and the human is back to
- * copying ids.
+ * catalogue through DSH's services. So every field is treated as untrusted and
+ * DEFAULTED rather than passed through: one malformed session record may cost
+ * that one row, never the whole list.
  *
- * ⚠️⚠️ WHY IT GOES THROUGH `sessionController.list()` AND NOT THROUGH THE
- * PROJECTION CACHE DIRECTLY (learned in front of the user, 2026-10-17, twice):
+ * ── HOW THE TITLE IS OBTAINED, AND WHY THIS FILE HAS BEEN WRONG TWICE ───────
  *
- *   `sessionController.list()` is DSH's OWN "give me every session, with its
- *   cached title" call. It is what the Web GUI's sidebar reads. The title arrives
- *   as `summary.projections.values.title`, already resolved by the shipped code.
+ * Three shapes were tried on a live 0.2.1-rc.2 deployment on 2026-10-17, and only
+ * the third one works:
  *
- *   Calling `sessionProjectionCache.cachedSnapshot(header, …)` directly means
- *   committing to that method's EXACT signature — and that signature DIFFERS
- *   between the versions on this machine: `cachedSnapshot(meta, keys?)` in the
- *   running 0.2.1-rc.2 (extracted from `app.asar`), but
- *   `cachedSnapshot(meta, inheritedEventCount, keys?)` in the older 0.1.5-rc.1
- *   tree that still sits in `~/.dsh/profiles/node_modules`. Guessing wrong does
- *   not fail loudly: the keys land in the wrong slot, `new Set(0)` throws for
- *   every unseeded session, and the picker silently loses every title while all
- *   tests stay green — which is exactly what happened. Going through the shipped
- *   list call delegates that signature to the code that owns it, so the picker
- *   keeps working across DSH versions without this module tracking them.
+ *  1. Rows from `sessionQuery.listSessions()` + titles from
+ *     `sessionProjectionCache.cachedSnapshot(header, ['title'])`. The CALL is
+ *     right (proved by extracting the package from `app.asar`); it was then
+ *     "fixed" into a three-argument call after reading the STALE 0.1.5 copy in
+ *     `~/.dsh/profiles/node_modules`, which silently broke every title.
  *
- * WHAT IT DELIBERATELY DOES NOT DO: it never wakes, resumes, or reads a
- * transcript. A picker must not start a turn (that is this plugin's entire
- * promise), and reading somebody's conversation is not needed to list it.
+ *  2. Rows from `sessionController.list()` — the call the sidebar makes, but its
+ *     host service returns `{ items: SessionSummary[] }` (NOT an array) and
+ *     filters rows through `remoteAccess.allows`; reading it as an array yields
+ *     zero rows.
+ *
+ *  3. THIS FILE: rows from `sessionQuery.listSessions()` (a plain listing), and
+ *     titles from the projection cache with **signature adaptation** — 0.2.1's
+ *     `(meta, keys?)` vs the older `(meta, inheritedEventCount, keys?)`. If the
+ *     cache serves no titles at all, it falls back to folding them out of the
+ *     session logs (`readTitleSnapshots`) for the visible page only, which is
+ *     expensive (the 40 most recent logs total 67 MB) and therefore a last resort
+ *     that is REPORTED, never silent.
+ *
+ * ⇒ The durable rule: a contract must be read from the DSH that is actually
+ * running (`app.asar` / Inspect), and the test double must model that version.
+ * Both earlier mistakes passed every unit test.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO: it never wakes, resumes, or opens a
+ * transcript on the normal path. A picker must not start a turn (that is this
+ * plugin's entire promise).
  *
  * DEGRADATION IS STATED, NEVER IMPLIED (the project's c7 rule):
- *  - neither service         -> `{ok:false, error}` naming what is missing;
- *  - no sessionController    -> rows still list (via `sessionQuery`), but titles
- *                               are reported unavailable, because the only cheap
- *                               title source is that cached list;
- *  - no sessions directory   -> times come from the runtime's own `updatedAt`;
- *  - a malformed record      -> skipped, and `skipped` counts it.
+ *  - no session catalogue service -> `{ok:false, error}` naming what is missing;
+ *  - cache titles unavailable      -> titles folded from logs (reported), or
+ *                                     `titlesStatus: 'unavailable: …'`;
+ *  - no sessions directory         -> every row's time is absent and `timeSource`
+ *                                     is `unavailable` with a reason;
+ *  - a malformed record            -> skipped, and `skipped` counts it.
  *
  * @module dsh-attention-group/sessions
  */
@@ -59,13 +66,21 @@ import { join } from 'node:path'
 /**
  * How many sessions one picker payload may carry.
  *
- * Not a cost ceiling — the whole lookup is one session listing plus in-memory
+ * Not a cost ceiling — the whole lookup is one session listing plus zero-I/O
  * projection reads — but a reading ceiling: a list that starts scrolling past
  * forty rows is worse than typing an id, and the payload always reports the TRUE
  * total, so the panel can say how much it is not showing instead of pretending
  * this is everything.
  */
 export const MAX_CANDIDATES = 40
+
+/**
+ * How many log folds the last-resort title path may perform in one call.
+ *
+ * Only reached when the projection cache serves nothing at all, and then it is
+ * capped so a broken cache cannot turn one click into an unbounded disk read.
+ */
+const MAX_LOG_FOLDS = 40
 
 /** Session logs live at `<DSH_HOME>/sessions/<workspace>/<sessionId>/session.*`. */
 const SESSIONS_DIR = 'sessions'
@@ -101,14 +116,13 @@ function entryIsFile(entry) {
 }
 
 /**
- * When each session log was last written — a FALLBACK for the runtime's own
- * `updatedAt`.
+ * When each session log was last written.
  *
- * Why a fallback and not the primary source: `sessionController.list()` already
- * reports each session's last activity (the greater of its creation and its last
- * prompt), which is the figure the sidebar orders by. Only when the runtime
- * cannot report one (or cannot be asked at all) does the log's mtime fill in: it
- * IS the last time anything happened in that session.
+ * This is the picker's activity time: the runtime's own per-session last-activity
+ * figure lives on `sessionController.list()`, whose host shape is `{ items }`;
+ * taking it from the log mtime keeps the picker on ONE cheap source and still
+ * answers the question a person is actually asking ("which of these did anything
+ * recently").
  *
  * Read-only and best-effort by design: a deployment that keeps sessions
  * elsewhere simply gets `scanned:false` with a reason, and the picker still
@@ -185,12 +199,12 @@ function newestFileTime(dir) {
 /**
  * A title as the payload should carry it, or `''` when the runtime reported none.
  *
- * A display budget, not a data cut: the runtime's cached title can legitimately be
- * a few hundred characters (a fallback title is the opening prompt's first line),
- * and forty of those would bloat a payload the panel draws on one line. The full
+ * A display budget, not a data cut: a cached title can legitimately be a few
+ * hundred characters (a fallback title is the opening prompt's first line), and
+ * forty of those would bloat a payload the panel draws on one line. The full
  * title stays in the session log.
  *
- * @param {unknown} value - `summary.projections.values.title`, whatever it is.
+ * @param {unknown} value - whatever the source returned.
  * @returns {string} the title, or ''.
  */
 function titleOf(value) {
@@ -198,6 +212,93 @@ function titleOf(value) {
   const text = value.trim()
   if (text.length === 0) return ''
   return text.length > 120 ? `${text.slice(0, 120)}…` : text
+}
+
+/**
+ * One session's cached title — WITHOUT reading its log.
+ *
+ * ⚠️ THE ARGUMENT COUNT IS THE WHOLE PROBLEM, and it differs between DSH
+ * versions ON THIS MACHINE:
+ *   - the running 0.2.1-rc.2 (extracted from `app.asar`) declares
+ *     `cachedSnapshot(meta, keys?)` and `cachedPredecessorTitle(meta)`;
+ *   - the stale 0.1.5-rc.1 tree in `~/.dsh/profiles/node_modules` declares
+ *     `cachedSnapshot(meta, inheritedEventCount, keys?)`.
+ * Passing the wrong one does not fail politely: 0.2.1 treats the cut as `keys`
+ * and `new Set(0)` throws, so every unseeded session loses its title. Hence the
+ * adaptation: the live implementation's declared parameter count is the only
+ * honest discriminator available at runtime.
+ *
+ * The order — own checkpoint first, predecessor second — is copied from the
+ * shipped `dsh-api-session-controller` (`projectionsFor`), not invented here.
+ *
+ * @param {object} cache - the `sessionProjectionCache` service.
+ * @param {object} header - the session header (the cache's identity witness).
+ * @returns {string} the title, or '' when nothing usable exists.
+ */
+function cachedTitle(cache, header) {
+  if (cache === undefined || cache === null || header === undefined || header === null) return ''
+  const arity = typeof cache.cachedSnapshot === 'function' ? cache.cachedSnapshot.length : 0
+  const snapshotOf =
+    arity >= 3
+      ? (meta) => cache.cachedSnapshot(meta, 0, ['title'])
+      : arity === 2
+        ? (meta) => cache.cachedSnapshot(meta, ['title'])
+        : undefined
+  const predecessorOf =
+    typeof cache.cachedPredecessorTitle === 'function'
+      ? cache.cachedPredecessorTitle.length >= 2
+        ? (meta) => cache.cachedPredecessorTitle(meta, 0)
+        : (meta) => cache.cachedPredecessorTitle(meta)
+      : undefined
+  // ⚠️ The own checkpoint is tried for SEEDED sessions too. The old 0.1.5 face
+  // carried the inherited cut in its identity, so a forked session could never
+  // match its own record and only a predecessor title was left; the live 0.2.1
+  // identity has no cut, so the own checkpoint DOES match (measured: the one
+  // forked session on this machine has a cached title). Guarding on `isSeeded`
+  // here cost that session its name for no reason.
+  let block
+  if (snapshotOf !== undefined) block = snapshotOf(header)
+  if (block === undefined && predecessorOf !== undefined) block = predecessorOf(header)
+  return titleOf(block?.values?.title)
+}
+
+/**
+ * Last-resort titles: fold them out of the session logs.
+ *
+ * `sessionQuery.readTitleSnapshots` loads each session's COMPLETE event log. On
+ * this machine the 40 most recent logs total 67 MB (one is 11 MB), so this is far
+ * too expensive to be the normal path and is only reached when the projection
+ * cache serves no titles at all. Bounded by {@link MAX_LOG_FOLDS} so a broken
+ * cache cannot turn one click into an unbounded read.
+ *
+ * @param {object} query - the `sessionQuery` service.
+ * @param {string[]} ids - ids to fold, in display order.
+ * @returns {Promise<{titles: Map<string, string>, status: string}>}
+ */
+async function foldTitlesFromLogs(query, ids) {
+  const titles = new Map()
+  if (typeof query?.readTitleSnapshots !== 'function') {
+    return { titles, status: 'unavailable: this deployment cannot read session titles' }
+  }
+  const wanted = ids.slice(0, MAX_LOG_FOLDS)
+  let results
+  try {
+    results = await query.readTitleSnapshots(wanted)
+  } catch (error) {
+    return { titles, status: `unavailable: reading session titles failed: ${errorMessage(error)}` }
+  }
+  let failed = 0
+  for (const row of Array.isArray(results) ? results : []) {
+    if (row?.status !== 'fulfilled') {
+      failed += 1
+      continue
+    }
+    const id = typeof row?.sessionId === 'string' ? row.sessionId : undefined
+    const title = titleOf(row?.value?.title?.title)
+    if (id !== undefined && title.length > 0) titles.set(id, title)
+  }
+  const suffix = failed === 0 ? '' : ` (${failed} unreadable)`
+  return { titles, status: `recovered by reading session logs${suffix}` }
 }
 
 /**
@@ -271,38 +372,11 @@ export function sortSessionCandidates(rows) {
 }
 
 /**
- * One row from a `sessionController.list()` summary.
- *
- * @param {object} summary - `SessionSummary` from the runtime.
- * @param {object} workspaces - result of {@link workspaceIndex}.
- * @returns {object|undefined} a row, or `undefined` when the summary has no id.
- */
-function rowFromSummary(summary, workspaces) {
-  const id = typeof summary?.sessionId === 'string' ? summary.sessionId : ''
-  if (id.length === 0) return undefined
-  const cwd = typeof summary?.cwd === 'string' ? summary.cwd : ''
-  const workspace =
-    workspaces.bySession.get(id) ?? (cwd.length > 0 ? workspaces.byPath.get(normalizePath(cwd)) : undefined)
-  return {
-    id,
-    title: titleOf(summary?.projections?.values?.title),
-    // The runtime's own last-activity figure: max(createdAt, lastPromptAt).
-    lastUsedMs: Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0 ? summary.updatedAt : undefined,
-    live: summary?.running === true,
-    // A subagent's own session is a real session and can be invited, but it is
-    // not one a person picks by title, so it is marked rather than hidden.
-    subagent: summary?.origin === 'subagent',
-    cwd,
-    workspace: typeof workspace === 'string' ? workspace : '',
-  }
-}
-
-/**
  * The picker's payload: which sessions could be invited into a room.
  *
  * @param {object} options
  *   - `ctx`: Cordis context (only `get` is used, and only optionally);
- *   - `dshHome`: the DSH home, for session-log mtimes (fallback times only);
+ *   - `dshHome`: the DSH home, for session-log mtimes;
  *   - `max`: ceiling on returned rows (defaults to MAX_CANDIDATES).
  * @returns {Promise<object>} `{ok:true, sessions, total, shown, max, …}` or
  *   `{ok:false, error}` when the deployment cannot list sessions at all.
@@ -315,98 +389,84 @@ function rowFromSummary(summary, workspaces) {
 export async function listSessionCandidates(options = {}) {
   const { ctx, dshHome } = options
   const max = Number.isFinite(options.max) && options.max > 0 ? Math.floor(options.max) : MAX_CANDIDATES
-  const controller = typeof ctx?.get === 'function' ? ctx.get('sessionController') : undefined
   const query = typeof ctx?.get === 'function' ? ctx.get('sessionQuery') : undefined
-
-  const workspaces = workspaceIndex(ctx)
-  const scanned = sessionLogTimes(dshHome)
-  const rows = []
-  let skipped = 0
-  let titleStatus = 'ok'
-  let timeSource = 'session-controller.updatedAt'
-  let usedController = false
-
-  if (typeof controller?.list === 'function') {
-    usedController = true
-    // PRIMARY: the runtime's own session list, which is what the Web GUI's
-    // sidebar reads. Titles arrive already resolved (see the module comment).
-    let summaries
-    try {
-      summaries = await controller.list(new AbortController().signal)
-    } catch (error) {
-      return { ok: false, error: `cannot list sessions: ${errorMessage(error)}` }
-    }
-    const list = Array.isArray(summaries) ? summaries : []
-    for (const summary of list) {
-      const row = rowFromSummary(summary, workspaces)
-      if (row === undefined) skipped += 1
-      else rows.push(row)
-    }
-  } else if (typeof query?.listSessions === 'function') {
-    // FALLBACK: no session controller in this composition. Rows are still
-    // available; titles are not, because the only cheap title source is that
-    // cached list. Say so instead of showing a screen of ids as names.
-    let records
-    try {
-      records = await query.listSessions()
-    } catch (error) {
-      return { ok: false, error: `cannot list sessions: ${errorMessage(error)}` }
-    }
-    for (const record of Array.isArray(records) ? records : []) {
-      const header = record?.header
-      const id = typeof header?.id === 'string' ? header.id : ''
-      if (id.length === 0) {
-        skipped += 1
-        continue
-      }
-      const cwd = typeof header?.cwd === 'string' ? header.cwd : ''
-      const workspace =
-        workspaces.bySession.get(id) ?? (cwd.length > 0 ? workspaces.byPath.get(normalizePath(cwd)) : undefined)
-      rows.push({
-        id,
-        title: '',
-        lastUsedMs: undefined,
-        live: record?.live === true,
-        subagent: header?.origin === 'subagent',
-        cwd,
-        workspace: typeof workspace === 'string' ? workspace : '',
-      })
-    }
-    titleStatus =
-      'unavailable: this deployment has no sessionController, so its cached session titles cannot be read without loading every session log'
-    timeSource = 'session-log-mtime'
-  } else {
+  const cache = typeof ctx?.get === 'function' ? ctx.get('sessionProjectionCache') : undefined
+  if (query === undefined || query === null || typeof query.listSessions !== 'function') {
     // A picker with no catalogue is not an empty catalogue: say which capability
     // is missing, because "nothing to pick" and "cannot ask" are different facts
     // and only one of them is the user's fault.
     return {
       ok: false,
-      error:
-        'this deployment has no sessionController.list (and no sessionQuery), so the panel cannot list sessions; paste a session id instead',
+      error: 'this deployment has no sessionQuery service, so the panel cannot list sessions; paste a session id instead',
     }
   }
 
-  // Fill in any missing time from the session logs. The runtime's own figure wins
-  // because it is the one the sidebar's order is based on; the log mtime is the
-  // honest fallback when the runtime reports none.
-  let fromLog = 0
-  for (const row of rows) {
-    if (row.lastUsedMs !== undefined) continue
-    const fromScan = scanned.times.get(row.id)
-    if (fromScan === undefined) continue
-    row.lastUsedMs = fromScan
-    fromLog += 1
+  let records
+  try {
+    records = await query.listSessions()
+  } catch (error) {
+    return { ok: false, error: `cannot list sessions: ${errorMessage(error)}` }
   }
-  // "mixed" only means something when there WERE runtime times to mix with.
-  if (fromLog > 0 && rows.length > 0 && usedController) timeSource = 'mixed: sessionController.updatedAt + session-log-mtime'
-  if (rows.every((row) => row.lastUsedMs === undefined)) {
-    // No time from anywhere. Say that, instead of letting every row promise a
-    // 「最后活动」 that was never read.
-    timeSource = 'unavailable'
+
+  const scanned = sessionLogTimes(dshHome)
+  const workspaces = workspaceIndex(ctx)
+  const rows = []
+  const headers = new Map()
+  let skipped = 0
+  for (const record of Array.isArray(records) ? records : []) {
+    const header = record?.header
+    const id = typeof header?.id === 'string' ? header.id : ''
+    if (id.length === 0) {
+      skipped += 1
+      continue
+    }
+    const cwd = typeof header?.cwd === 'string' ? header.cwd : ''
+    const workspace =
+      workspaces.bySession.get(id) ?? (cwd.length > 0 ? workspaces.byPath.get(normalizePath(cwd)) : undefined)
+    headers.set(id, header)
+    rows.push({
+      id,
+      title: '',
+      lastUsedMs: scanned.times.get(id),
+      live: record?.live === true,
+      // A subagent's own session is a real session and can be invited, but it is
+      // not one a person picks by title, so it is marked rather than hidden.
+      subagent: header?.origin === 'subagent',
+      cwd,
+      workspace: typeof workspace === 'string' ? workspace : '',
+    })
   }
 
   const ordered = sortSessionCandidates(rows)
   const page = ordered.slice(0, max)
+
+  // ── titles ────────────────────────────────────────────────────────────────
+  // Pass 1: the projection cache, zero I/O, one call per visible row. This is
+  // exactly what the Web GUI's own session list does, and it is normally enough.
+  let cacheFailures = 0
+  let cacheError = ''
+  for (const row of page) {
+    try {
+      row.title = cachedTitle(cache, headers.get(row.id))
+    } catch (error) {
+      cacheFailures += 1
+      if (cacheError.length === 0) cacheError = errorMessage(error)
+    }
+  }
+  let titlesStatus = cacheFailures === 0 ? 'ok' : `partial: ${cacheFailures} of ${page.length} cached title(s) were unreadable`
+  if (page.length > 0 && page.every((row) => row.title.length === 0)) {
+    // Pass 2 (last resort): the cache served nothing for the whole page, so read
+    // the titles out of the session logs. Expensive, bounded, and REPORTED — the
+    // panel can then say why a click was slow instead of pretending the sessions
+    // are nameless.
+    const folded = await foldTitlesFromLogs(query, page.map((row) => row.id))
+    for (const row of page) row.title = folded.titles.get(row.id) ?? row.title
+    titlesStatus =
+      folded.titles.size > 0
+        ? `degraded: ${folded.status} because the projection cache served no titles${cacheError.length > 0 ? ` (${cacheError})` : ''}`
+        : folded.status
+  }
+
   const untitled = page.filter((row) => row.title.length === 0).length
 
   return {
@@ -428,12 +488,15 @@ export async function listSessionCandidates(options = {}) {
     shown: page.length,
     max,
     skipped,
-    // Where the activity times came from, and whether that source existed at all.
-    timeSource,
-    ...(timeSource !== 'unavailable' || scanned.error === undefined ? {} : { timeDetail: scanned.error }),
-    titlesStatus: titleStatus,
+    titleSource: titlesStatus.startsWith('degraded') ? 'session-logs' : 'projection-cache',
+    titlesStatus,
     // How many rows will show 「无标题会话」 — a healthy absence, not a failure.
     untitled,
+    // Where the activity times came from, and whether that source existed at all.
+    // Only claim it is unavailable when NO row has a time: a single undated row
+    // already says 「活动时间未知」 on its own line, and a banner for it is noise.
+    timeSource: page.length === 0 || page.some((row) => row.lastUsedMs !== undefined) ? 'session-log-mtime' : 'unavailable',
+    ...(scanned.error === undefined ? {} : { timeDetail: scanned.error }),
     workspacesStatus: workspaces.status,
   }
 }

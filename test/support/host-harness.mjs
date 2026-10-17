@@ -205,55 +205,24 @@ export async function createHost(options = {}) {
                 }),
           }
         }
-        // ⚠️ The picker must NOT hand-roll a call into the projection cache. That
-        // method's signature differs between DSH versions — `cachedSnapshot(meta,
-        // keys?)` in the running 0.2.1-rc.2 (extracted from app.asar) vs
-        // `cachedSnapshot(meta, inheritedEventCount, keys?)` in the older 0.1.5 tree
-        // that still sits in ~/.dsh/profiles/node_modules — and guessing wrong
-        // loses every title silently while tests stay green, which is exactly what
-        // happened in front of the user on 2026-10-17. This stub fails loudly if
-        // that regresses: the shipped list call below is the only supported way in.
-        if (name === 'sessionProjectionCache') {
+        // ⚠️ The projection cache is the picker's cheap title source, and its
+        // signature DIFFERS between DSH versions: the running 0.2.1-rc.2 (extracted
+        // from app.asar) is `cachedSnapshot(meta, keys?)`, while the stale
+        // 0.1.5-rc.1 tree in ~/.dsh/profiles/node_modules declares a middle
+        // `inheritedEventCount`. Guessing wrong loses every title silently while
+        // tests stay green — which is exactly what happened in front of the user on
+        // 2026-10-17. This stub declares the LIVE arity (two parameters), so the
+        // module's adaptation takes the live branch here.
+        if (name === 'sessionProjectionCache' && sessionCatalog !== undefined) {
           return {
-            cachedSnapshot() {
-              throw new Error('the picker must use sessionController.list(), not the projection cache directly')
+            cachedSnapshot(meta, keys) {
+              const row = sessionCatalog.find((candidate) => String(candidate.id) === String(meta?.id))
+              if (row === undefined || typeof row.title !== 'string' || row.title.length === 0) return undefined
+              return { asOfSeq: 1, values: { title: row.title } }
             },
             cachedPredecessorTitle() {
-              throw new Error('the picker must use sessionController.list(), not the projection cache directly')
+              return undefined
             },
-          }
-        }
-        // The runtime's own session list — what the Web GUI's sidebar reads, and the
-        // picker's PRIMARY source. Titles arrive already resolved as
-        // `projections.values.title`, exactly like a real `SessionSummary`.
-        if (name === 'sessionController' && (sessionCatalog !== undefined || withSessionController)) {
-          return {
-            ...(withSessionController
-              ? {
-                  async selectModel(request) {
-                    effortCalls.push(request)
-                    return {}
-                  },
-                }
-              : {}),
-            ...(sessionCatalog === undefined
-              ? {}
-              : {
-                  async list(_request, _signal) {
-                    return sessionCatalog.map((row) => ({
-                      sessionId: String(row.id),
-                      updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : 0,
-                      running: row.live === true,
-                      blank: false,
-                      agentAvailable: row.live === true,
-                      ...(typeof row.origin === 'string' ? { origin: row.origin } : {}),
-                      ...(typeof row.cwd === 'string' ? { cwd: row.cwd } : {}),
-                      ...(typeof row.title === 'string' && row.title.length > 0
-                        ? { projections: { kind: 'cached', asOfSeq: 1, values: { title: row.title } } }
-                        : {}),
-                    }))
-                  },
-                }),
           }
         }
         if (name === 'workspaceRegistry' && workspaces.length > 0) {

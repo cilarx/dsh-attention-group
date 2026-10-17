@@ -65,65 +65,58 @@ for (const name of readdirSync(cacheDir)) {
 console.log(`\n== real data ==`)
 console.log(`  projection cache: ${cacheRecords.size} record(s)`)
 
-/** The current `title` projection state-schema version (dsh-session-title). */
-const TITLE_UNIT_VERSION = 1
-/** The wire view of the title unit is the state itself, a string. */
-function cachedTitleOf(id) {
-  const row = cacheRecords.get(id)?.rows?.title
-  if (row === undefined || row.ver !== TITLE_UNIT_VERSION) return ''
-  return typeof row.val === 'string' ? row.val.trim() : ''
-}
-/** `updatedAt` = max(createdAt, sessionListMetadata.lastPromptAt). */
-function updatedAtOf(id, createdAt) {
-  const metadata = cacheRecords.get(id)?.rows?.sessionListMetadata
-  let lastPromptAt = 0
-  if (metadata !== undefined && metadata.ver === 1 && metadata.val !== null && typeof metadata.val === 'object') {
-    lastPromptAt = Number.isFinite(metadata.val.lastPromptAt) ? metadata.val.lastPromptAt : 0
-  }
-  return Math.max(Number.isFinite(createdAt) ? createdAt : 0, lastPromptAt)
-}
-
-// ---------------------------------------------------------------------------
-// 2. a faithful stand-in for `sessionController.list()` on 0.2.1-rc.2
-//
-//   list() = sessionQuery.listSessions() → live ? summarizeLive : (cold with a
-//   cwd ? summarizeCold : dropped) → sorted by updatedAt.
-//   summarizeCold returns {sessionId, updatedAt, running:false, blank, cwd?,
-//   origin?, projections?} where projections is the cached block (title).
-// ---------------------------------------------------------------------------
 const sessionsRoot = join(home, 'sessions')
-const summaries = []
-let omittedNoCwd = 0
+const records = []
 if (existsSync(sessionsRoot)) {
   for (const bucket of readdirSync(sessionsRoot, { withFileTypes: true })) {
     if (bucket.isDirectory() !== true) continue
     for (const entry of readdirSync(join(sessionsRoot, bucket.name), { withFileTypes: true })) {
       if (entry.isDirectory() !== true) continue
       const identity = cacheRecords.get(entry.name)?.identity
-      const createdAt = identity?.createdAt ?? 0
-      const cwd = identity?.cwd
-      if (cwd === undefined) {
-        // The shipped `list()` drops cold sessions without a cwd.
-        omittedNoCwd += 1
-        continue
-      }
-      const title = cachedTitleOf(entry.name)
-      summaries.push({
-        sessionId: entry.name,
-        updatedAt: updatedAtOf(entry.name, createdAt),
-        running: false,
-        blank: false,
-        agentAvailable: false,
-        cwd,
-        ...(title.length === 0 ? {} : { projections: { kind: 'cached', asOfSeq: 1, values: { title } } }),
+      records.push({
+        header: {
+          version: identity?.formatVersion ?? 4,
+          id: entry.name,
+          createdAt: identity?.createdAt ?? 0,
+          isSeeded: identity?.isSeeded === true,
+          ...(identity?.cwd === undefined ? {} : { cwd: identity.cwd }),
+          ...(identity?.origin === undefined ? {} : { origin: identity.origin }),
+        },
+        live: false,
+        persisted: true,
       })
     }
   }
 }
-summaries.sort((left, right) => right.updatedAt - left.updatedAt)
-console.log(`  session dirs:      ${summaries.length + omittedNoCwd}`)
-console.log(`  omitted (no cwd):  ${omittedNoCwd}`)
-console.log(`  with a cached title: ${summaries.filter((row) => row.projections !== undefined).length}`)
+console.log(`  session dirs:      ${records.length}`)
+
+/** The current `title` projection state-schema version (dsh-session-title). */
+const TITLE_UNIT_VERSION = 1
+/** lifecycleIdentityOf(meta): formatVersion, createdAt, cwd, isSeeded — no cut. */
+function lifecycleOf(meta) {
+  return {
+    formatVersion: meta?.version,
+    createdAt: meta?.createdAt,
+    ...(meta?.cwd === undefined ? {} : { cwd: meta.cwd }),
+    isSeeded: meta?.isSeeded === true,
+  }
+}
+const sameScalar = (a, b) => (a === undefined ? b === undefined : String(a) === String(b))
+function cachedTitleOf(meta, keys) {
+  const expected = lifecycleOf(meta)
+  const record = cacheRecords.get(meta?.id)
+  if (record === undefined) return undefined
+  const stored = record.identity
+  if (stored.formatVersion !== expected.formatVersion) return undefined
+  if (!sameScalar(stored.createdAt, expected.createdAt)) return undefined
+  if (!sameScalar(stored.cwd, expected.cwd)) return undefined
+  if ((stored.isSeeded === true) !== (expected.isSeeded === true)) return undefined
+  if (keys !== undefined && !keys.includes('title')) return undefined
+  const row = record.rows?.title
+  if (row === undefined || row.ver !== TITLE_UNIT_VERSION) return undefined
+  if (typeof row.val !== 'string' || row.val.trim().length === 0) return undefined
+  return { asOfSeq: row.seq, values: { title: row.val } }
+}
 
 // ---------------------------------------------------------------------------
 // 3. the real workspace registry
@@ -140,15 +133,38 @@ console.log(`  workspaces:        ${workspaces.length}`)
 
 const ctx = {
   get(name) {
-    if (name === 'sessionController') return { async list() { return summaries } }
-    if (name === 'workspaceRegistry') return { list: () => workspaces }
-    if (name === 'sessionProjectionCache') {
-      throw new Error('the picker must not touch the projection cache directly')
+    if (name === 'sessionQuery') {
+      return {
+        async listSessions() {
+          return records
+        },
+        async readTitleSnapshots() {
+          throw new Error('the expensive fold path must not run while the cache works')
+        },
+      }
     }
+    if (name === 'sessionProjectionCache') {
+      return {
+        // Declared with TWO parameters: the live 0.2.1 arity, which the module
+        // uses to decide the call shape.
+        cachedSnapshot(meta, keys) {
+          return cachedTitleOf(meta, keys)
+        },
+        cachedPredecessorTitle(meta) {
+          lifetimeGuard(meta)
+          return undefined
+        },
+      }
+    }
+    if (name === 'workspaceRegistry') return { list: () => workspaces }
     return undefined
   },
 }
 
+/** The real predecessor read validates its own lifecycle too. */
+function lifetimeGuard(meta) {
+  return lifecycleOf(meta)
+}
 // ---------------------------------------------------------------------------
 // 4. run the plugin's own function over the real data
 // ---------------------------------------------------------------------------
@@ -164,8 +180,8 @@ if (payload.ok !== true) {
   ok(`titlesStatus "${payload.titlesStatus}"`)
   ok(`timeSource "${payload.timeSource}"`)
   if (payload.titlesStatus !== 'ok') fail(`the titles are not fully readable: ${payload.titlesStatus}`)
-  if (!payload.timeSource.startsWith('session-controller') && payload.timeSource !== 'mixed: sessionController.updatedAt + session-log-mtime') {
-    fail(`the activity times did not come from the runtime's own figure: ${payload.timeSource}`)
+  if (payload.timeSource !== 'session-log-mtime') {
+    fail(`the activity times did not come from the session logs: ${payload.timeSource}`)
   }
 
   console.log('\n  the rows the picker would draw:')
@@ -184,7 +200,7 @@ if (payload.ok !== true) {
   let invented = 0
   let shouldHaveTitle = 0
   for (const row of payload.sessions) {
-    const cached = cachedTitleOf(row.id)
+    const cached = typeof cacheRecords.get(row.id)?.rows?.title?.val === 'string' ? cacheRecords.get(row.id).rows.title.val.trim() : ''
     if (row.title === '') {
       if (cached.length > 0) shouldHaveTitle += 1
       continue

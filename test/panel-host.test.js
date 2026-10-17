@@ -629,14 +629,15 @@ test('the picker lists sessions with title, workspace and last activity, and mar
     assert.equal(listed.json.sessions.length, 3)
     assert.equal(byId.get(catalog[0].id).title, '插件工程协调', 'the title the sidebar shows must travel')
     assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认', 'the workspace is the tie-breaker for similar titles')
-    assert.equal(byId.get(catalog[0].id).lastUsedAt, '2026-10-17T12:00:00.000Z', "last activity is the runtime's own updatedAt")
+    assert.equal(byId.get(catalog[0].id).lastUsedAt, '2026-10-17T12:00:00.000Z', 'last activity comes from the session log mtime')
     assert.equal(byId.get(catalog[0].id).live, true)
     assert.equal(byId.get(catalog[0].id).member, false)
     assert.equal(byId.get(catalog[1].id).member, true, 'a session already in this room must say so')
     assert.equal(byId.get(catalog[2].id).title, '')
     assert.equal(byId.get(catalog[2].id).subagent, true)
     assert.equal(byId.get(catalog[2].id).lastUsedAt, '', 'a session the runtime cannot date has no time, not a guess')
-    assert.equal(listed.json.timeSource, 'session-controller.updatedAt')
+    assert.equal(listed.json.titleSource, 'projection-cache')
+    assert.equal(listed.json.titlesStatus, 'ok')
     assert.equal(byId.get(catalog[0].id).workspace, 'DSH默认')
 
     // ⚠️ The list is cached (titles cost a log read per row), and membership is
