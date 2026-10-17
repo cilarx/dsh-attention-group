@@ -298,9 +298,10 @@ export async function mountPanel({ source, fetchImpl }) {
       change(node, value)
       panel.render()
     },
-    press(node, key) {
-      press(node, key)
+    press(node, key, init) {
+      const event = press(node, key, init)
       panel.render()
+      return event
     },
     /**
      * Focus a node, then re-render.
@@ -343,11 +344,37 @@ export function change(node, value) {
   node.props.onChange({ target: { value }, preventDefault() {}, stopPropagation() {} })
 }
 
-/** Press a key on a node. */
-export function press(node, key) {
+/**
+ * Press a key on a node.
+ *
+ * `init` carries the modifiers a real keydown would: the composer's whole
+ * behaviour is Enter vs Shift+Enter vs a composing Enter (Chinese IME), so a
+ * press that could only say "Enter" could not test any of it. The returned event
+ * records `defaultPrevented`, which is how a test can tell "the browser will
+ * insert a newline" from "this key was swallowed".
+ */
+export function press(node, key, init) {
   if (node === undefined) throw new Error('press() got no node')
   if (typeof node.props.onKeyDown !== 'function') throw new Error(`${node.type} has no onKeyDown`)
-  node.props.onKeyDown({ key, preventDefault() {}, stopPropagation() {}, target: {} })
+  const options = init ?? {}
+  const event = {
+    key,
+    shiftKey: options.shiftKey === true,
+    ctrlKey: options.ctrlKey === true,
+    altKey: options.altKey === true,
+    metaKey: options.metaKey === true,
+    isComposing: options.isComposing === true,
+    keyCode: options.keyCode,
+    nativeEvent: options.nativeEvent,
+    target: {},
+    defaultPrevented: false,
+    preventDefault() {
+      event.defaultPrevented = true
+    },
+    stopPropagation() {},
+  }
+  node.props.onKeyDown(event)
+  return event
 }
 
 /** Focus a node, with the shape of a real React synthetic focus event. */

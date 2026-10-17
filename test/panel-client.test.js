@@ -223,7 +223,7 @@ const CANDIDATES = {
  * @returns {Function} a fetch implementation.
  */
 function fakeHost(options = {}) {
-  const { fail, candidatesFail, candidatesMissing } = options
+  const { fail, candidatesFail, candidatesMissing, patchDetail } = options
   return (record) => {
     if (record.method === 'POST') {
       const body = record.body ?? {}
@@ -276,7 +276,9 @@ function fakeHost(options = {}) {
             { id: P_ID, title: 'P群' },
             { id: Q_ID, title: 'Q群' },
           ],
-          ...(groupId === undefined ? {} : { group: DETAIL[groupId] }),
+          ...(groupId === undefined
+            ? {}
+            : { group: patchDetail === undefined ? DETAIL[groupId] : patchDetail(DETAIL[groupId]) }),
         }),
     })
   }
@@ -563,7 +565,7 @@ test('speaking in a room never asks anyone to wake', async () => {
 
   const composer = findAll(
     panel.tree,
-    (node) => node.type === 'input' && (node.props.placeholder ?? '').includes('以「用户」身份发言'),
+    (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'),
   )[0]
   assert.ok(composer !== undefined, 'the human needs a place to speak')
   panel.change(composer, '大家好 @甲')
@@ -1029,4 +1031,188 @@ test('the box still takes a pasted id, and 拉进来 still sends it', async () =
   panel.click(findButton(panel.tree, '拉进来'))
   await panel.settle()
   assert.deepEqual(panel.lastPost(), { action: 'join', group: P_ID, memberId: 'session-9999', kind: 'session' })
+})
+
+// ---------------------------------------------------------------------------
+// The composer: newlines and @ completion (2026-10-17, reported by the human).
+//
+// Two concrete complaints, both real: typing `@` in a room offered no names at
+// all, and there was no key for a newline — Enter sent the message and
+// Shift+Enter did nothing, because the box was an <input>, which cannot hold a
+// second line however the keyboard handler is written.
+// ---------------------------------------------------------------------------
+
+/** The room composer, found by the sentence in its placeholder. */
+function composerOf(tree) {
+  return findAll(tree, (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
+}
+
+/** The @ suggestion list, when it is open. */
+function mentionListOf(tree) {
+  return findAll(tree, (node) => node.props?.['aria-label'] === '选择要 @ 的人')[0]
+}
+
+/** Open P群 and hand back the panel with its composer on screen. */
+async function openChat(options = {}) {
+  const panel = await boot(options)
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  return panel
+}
+
+/** How many messages the panel actually sent to the host. */
+function postCount(panel) {
+  return panel.posts().filter((row) => row.action === 'post').length
+}
+
+test('the composer is a textarea, so a newline has somewhere to go', async () => {
+  const panel = await openChat()
+  const composer = composerOf(panel.tree)
+  assert.ok(composer !== undefined, 'the human needs a place to speak')
+  assert.equal(composer.type, 'textarea', 'an <input> can never hold a second line')
+  assert.equal(Number(composer.props.rows), 1, 'one line until there is something more to show')
+  panel.change(composer, '第一行\n第二行')
+  assert.equal(Number(composerOf(panel.tree).props.rows), 2, 'the box grows with the draft')
+})
+
+test('Enter sends, Shift+Enter is left to the browser, and neither asks for a wake', async () => {
+  const panel = await openChat()
+  const before = postCount(panel)
+  panel.change(composerOf(panel.tree), '第一行')
+
+  const shifted = panel.press(composerOf(panel.tree), 'Enter', { shiftKey: true })
+  assert.equal(shifted.defaultPrevented, false, 'Shift+Enter must fall through: the browser inserts the newline')
+  assert.equal(postCount(panel), before, 'Shift+Enter must not send')
+
+  const plain = panel.press(composerOf(panel.tree), 'Enter')
+  assert.equal(plain.defaultPrevented, true, 'plain Enter is the send')
+  assert.equal(postCount(panel), before + 1)
+  assert.equal(panel.lastPost().text, '第一行')
+  assert.equal('wake' in panel.lastPost(), false, 'a typed message is not an event')
+})
+
+test('a drafted newline survives sending', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '第一行\n第二行')
+  panel.press(composerOf(panel.tree), 'Enter')
+  assert.equal(panel.lastPost().text, '第一行\n第二行')
+})
+
+test('an Enter that is committing an IME candidate never sends', async () => {
+  // Chinese input sends Enter to commit the candidate. Sending there would eat
+  // the person's text mid-word, so it is checked twice (the flag, and keyCode 229).
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '你好')
+  const before = postCount(panel)
+  assert.equal(panel.press(composerOf(panel.tree), 'Enter', { isComposing: true }).defaultPrevented, false)
+  assert.equal(postCount(panel), before)
+  assert.equal(panel.press(composerOf(panel.tree), 'Enter', { keyCode: 229 }).defaultPrevented, false)
+  assert.equal(postCount(panel), before)
+})
+
+test('typing @ offers everyone in the room, plus 所有人', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '大家好 @')
+  const list = mentionListOf(panel.tree)
+  assert.ok(list !== undefined, 'typing @ must offer names')
+  const shown = textOf(list)
+  assert.match(shown, /所有人/)
+  assert.match(shown, /用户/)
+  assert.match(shown, /甲/)
+  assert.match(shown, /群管理/)
+  // This fixture does not report the room's @所有人 gate, and c16 forbids
+  // rendering "not reported" as 「关」.
+  assert.match(shown, /群开关状态宿主未报告/)
+})
+
+test('the list narrows as the name is typed, and a click completes it', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '看 @群')
+  const list = mentionListOf(panel.tree)
+  assert.ok(list !== undefined)
+  const filtered = textOf(list)
+  assert.match(filtered, /群管理/)
+  assert.doesNotMatch(filtered, /甲/, 'the filter must actually filter')
+  assert.doesNotMatch(filtered, /所有人/, '「所有人」 does not contain 「群」')
+
+  const row = findAll(
+    list,
+    (node) => node.type === 'div' && typeof node.props.onClick === 'function' && textOf(node).startsWith('群管理'),
+  )[0]
+  panel.click(row)
+  assert.equal(composerOf(panel.tree).props.value, '看 @群管理 ')
+  assert.equal(mentionListOf(panel.tree), undefined, 'completing the name closes the list')
+})
+
+test('Escape closes the list without losing the draft, and Enter then sends', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '问 @甲')
+  assert.ok(mentionListOf(panel.tree) !== undefined)
+  const escaped = panel.press(composerOf(panel.tree), 'Escape')
+  assert.equal(escaped.defaultPrevented, true)
+  assert.equal(mentionListOf(panel.tree), undefined, 'Esc dismisses the list')
+  panel.press(composerOf(panel.tree), 'Enter')
+  assert.equal(panel.lastPost().text, '问 @甲')
+})
+
+test('arrow keys move the highlight, and Enter takes the name instead of sending', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '问 @')
+  const before = postCount(panel)
+  // Rows: 所有人, 用户, 甲, 群管理 — one ArrowDown lands on 用户.
+  panel.press(composerOf(panel.tree), 'ArrowDown')
+  panel.press(composerOf(panel.tree), 'Enter')
+  assert.equal(postCount(panel), before, 'the first Enter belongs to the list, not to the send')
+  assert.equal(composerOf(panel.tree).props.value, '问 @用户 ')
+})
+
+test('the 所有人 row states the room gate instead of promising a broadcast', async () => {
+  const on = await openChat({ patchDetail: (detail) => ({ ...detail, mentionAll: true }) })
+  on.change(composerOf(on.tree), '@')
+  assert.match(textOf(mentionListOf(on.tree)), /叫醒全群/)
+
+  const off = await openChat({ patchDetail: (detail) => ({ ...detail, mentionAll: false }) })
+  off.change(composerOf(off.tree), '@')
+  assert.match(textOf(mentionListOf(off.tree)), /群开关「允许 @所有人」没开/)
+})
+
+test('an address is not a mention', async () => {
+  const panel = await openChat()
+  panel.change(composerOf(panel.tree), '发到 a@b.com')
+  assert.equal(mentionListOf(panel.tree), undefined, 'the @ must OPEN a word')
+})
+
+test('two members with one name are marked, because @ wakes both', async () => {
+  const panel = await openChat({
+    patchDetail: (detail) => ({
+      ...detail,
+      members: [
+        ...detail.members,
+        { id: 'twin', name: '甲', kind: 'session', enabled: true, subscribe: [], wakeEffort: '', wakeable: true, isHuman: false },
+      ],
+    }),
+  })
+  panel.change(composerOf(panel.tree), '@甲')
+  assert.match(textOf(mentionListOf(panel.tree)), /重名：@ 会同时叫醒/)
+})
+
+test('a long member list is capped and the rest are counted', async () => {
+  const many = Array.from({ length: 15 }, (unused, index) => ({
+    id: 'extra-' + String(index + 1),
+    name: '成员' + String(index + 1).padStart(2, '0'),
+    kind: 'session',
+    enabled: true,
+    subscribe: [],
+    wakeEffort: '',
+    wakeable: true,
+    isHuman: false,
+  }))
+  const panel = await openChat({ patchDetail: (detail) => ({ ...detail, members: [...detail.members, ...many] }) })
+  panel.change(composerOf(panel.tree), '@')
+  const list = mentionListOf(panel.tree)
+  const names = findAll(list, (node) => node.type === 'span' && /^成员\d+$/u.test(textOf(node)))
+  // 12 rows total: 所有人 + 用户 + 甲 + 群管理 + 成员01..08.
+  assert.equal(names.length, 8, 'the list is capped for readability')
+  // 3 fixture members + 15 added + 所有人 = 19 targets; 12 shown, 7 left out.
+  assert.match(textOf(list), /还有 7 个没列出来（共 19 个）/)
 })

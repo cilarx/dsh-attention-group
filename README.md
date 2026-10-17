@@ -406,9 +406,11 @@ list would be — it is never rendered as "you have no rooms".
 
 **Chat tab:** the charter, the message stream (newest last, auto-scrolled, capped at the
 newest 300 messages), a 「总结今天」 / 「最近24小时」 / 「全部」 digest bar that answers without
-waking anybody (and a 「收起」 button), and a composer that speaks as 「用户」 — `@名字`
-mentions work, Enter sends, Shift+Enter makes a newline. The panel's own post never wakes
-anyone.
+waking anybody (and a 「收起」 button), and a **multi-line** composer that speaks as 「用户」:
+**Enter sends, Shift+Enter makes a newline** (an Enter that is merely committing a Chinese IME
+candidate never sends), and typing `@` opens a completion list — every member name plus
+「所有人」 (`↑`/`↓` to move, `Enter`/`Tab` to fill, `Esc` to dismiss, or just click a row).
+The panel's own post never wakes anyone.
 
 **Settings tab:** 「群名称」, 「唤醒」, 「推理强度（群统一）」 (a slider), 「路由模式」, 「自省」,
 「未读写进系统提示」, 「群史摘要提醒」 (关 / 200 条 / 500 条 / 2000 条), 「群规」,

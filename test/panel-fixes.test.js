@@ -540,7 +540,7 @@ test('C-07 a relayed panel message reports the room it reached', async () => {
   })
   panel.click(findButton(panel.tree, '甲群'))
   await panel.settle()
-  const composer = findAll(panel.tree, (node) => node.type === 'input' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
+  const composer = findAll(panel.tree, (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
   panel.change(composer, '大家好')
   panel.click(findButton(panel.tree, '发送'))
   await panel.settle()
@@ -554,7 +554,7 @@ test('C-07 a refused relay reports the host’s reason instead of silence', asyn
   })
   panel.click(findButton(panel.tree, '甲群'))
   await panel.settle()
-  const composer = findAll(panel.tree, (node) => node.type === 'input' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
+  const composer = findAll(panel.tree, (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
   panel.change(composer, '大家好')
   panel.click(findButton(panel.tree, '发送'))
   await panel.settle()
@@ -579,7 +579,7 @@ test('C-08 the wake wording says a panel message wakes nobody', async () => {
   assert.match(button.props.title, /不叫醒任何人/u)
   assert.doesNotMatch(button.props.title, /被 @ 或命中订阅词的成员会被真的叫起来跑一轮/u, 'that sentence was false for anything typed here')
 
-  const composer = findAll(panel.tree, (node) => node.type === 'input' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
+  const composer = findAll(panel.tree, (node) => node.type === 'textarea' && (node.props.placeholder ?? '').includes('以「用户」身份发言'))[0]
   assert.match(composer.props.placeholder, /不会叫醒任何人/u)
   assert.match(textOf(panel.tree), /不叫醒任何人/u, 'and the truth must be VISIBLE, not only in a tooltip')
   assertNoLeaks(textOf(panel.tree), 'wake wording')

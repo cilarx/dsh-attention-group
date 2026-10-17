@@ -493,12 +493,69 @@ window.__ModuleLoader__.load({
       row: { marginBottom: '10px' },
       meta: { fontSize: '11px', opacity: 0.65, marginBottom: '2px' },
       text: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-      composer: {
+      // The composer is a COLUMN: the mention list sits above the box and pushes
+      // it up rather than floating over the transcript. An overlay would need an
+      // opaque background, and the only theme-safe surface this panel has is a
+      // translucent grey (c22) — messages would bleed through it.
+      composerWrap: {
         display: 'flex',
-        gap: '8px',
+        flexDirection: 'column',
+        gap: '6px',
         padding: '10px 14px',
         borderTop: '1px solid rgba(127,127,127,.22)',
       },
+      composer: {
+        display: 'flex',
+        gap: '8px',
+        alignItems: 'flex-end',
+      },
+      // A textarea, not an input: an <input> physically cannot hold a newline, so
+      // Shift+Enter had nowhere to put one.
+      composerInput: {
+        flex: '1 1 auto',
+        minWidth: 0,
+        maxHeight: '180px',
+        boxSizing: 'border-box',
+        padding: '7px 10px',
+        borderRadius: '8px',
+        border: '1px solid rgba(127,127,127,.3)',
+        background: 'transparent',
+        color: 'inherit',
+        font: 'inherit',
+        lineHeight: '1.5',
+        resize: 'none',
+      },
+      mentionList: {
+        border: '1px solid rgba(127,127,127,.28)',
+        borderRadius: '8px',
+        background: 'rgba(127,127,127,.10)',
+        maxHeight: '180px',
+        overflowY: 'auto',
+      },
+      mentionRow: {
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: '10px',
+        padding: '5px 10px',
+        fontSize: '12px',
+        cursor: 'pointer',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+      },
+      mentionRowActive: {
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: '10px',
+        padding: '5px 10px',
+        fontSize: '12px',
+        cursor: 'pointer',
+        background: 'rgba(127,127,127,.20)',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+      },
+      mentionName: { flex: '0 1 auto' },
+      mentionHint: { flex: '0 0 auto', fontSize: '11px', opacity: 0.6 },
+      mentionNote: { padding: '4px 10px', fontSize: '11px', opacity: 0.7 },
       input: {
         flex: '1 1 auto',
         minWidth: 0,
@@ -802,6 +859,89 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** How the host's member kinds read inside the mention list. */
+    var MENTION_KIND_TEXT = { session: '会话', user: '用户', admin: '群管理', bot: '机器人', liaison: '沟通员' }
+
+    /** At most this many mention rows are drawn; the rest are counted, not hidden. */
+    var MAX_MENTION_ROWS = 12
+
+    /**
+     * What the composer's `@` is asking for, if anything.
+     *
+     * A room addresses people BY NAME, so a misspelt name is not a mention: the
+     * message would be stored, nobody would be addressed, and nothing would say
+     * so. This only decides WHEN to offer names — `router.js` stays the authority
+     * on what counts as a mention.
+     *
+     * @param {string} draft - the composer text.
+     * @returns {{start:number, query:string}|null} offset of the `@` and the text after it.
+     */
+    function mentionQuery(draft) {
+      if (typeof draft !== 'string' || draft.length === 0) return null
+      var at = draft.lastIndexOf('@')
+      if (at < 0) return null
+      var before = at === 0 ? '' : draft.charAt(at - 1)
+      // `a@b` is an address, not a mention: the `@` must OPEN a word. Chinese
+      // punctuation opens one too, because sentences here rarely put a space
+      // before 「@」.
+      if (before !== '' && !/[\s，。、！？；：,.;:!?（）()\[\]【】「」『』<>《》"'“”‘’]/u.test(before)) return null
+      var tail = draft.slice(at + 1)
+      // A line break ends the mention; a space does NOT, because member names in
+      // this deployment contain spaces ("Agent会话群聊专项DSH Agent").
+      if (tail.length > 40 || /[\r\n]/u.test(tail)) return null
+      return { start: at, query: tail }
+    }
+
+    /**
+     * Who can be named right now.
+     *
+     * `@所有人` leads the list because it is the one target that is not a member,
+     * and its hint carries the room's gate: a person naming everyone deserves to
+     * know whether the room switch is on BEFORE they send it (and c16: a switch
+     * the host did not report is stated as unknown, never as off).
+     *
+     * @param {object|null} group - the open room.
+     * @param {string} query - the text typed after `@`.
+     * @returns {{rows: object[], total: number, omitted: number}} candidates and what was left out.
+     */
+    function mentionCandidates(group, query) {
+      var q = typeof query === 'string' ? query.toLowerCase() : ''
+      var rows = []
+      if (q === '' || '所有人'.indexOf(q) >= 0) {
+        var gate =
+          group !== null && group.mentionAll === true
+            ? '叫醒全群（只有用户和群管理能发）'
+            : group !== null && group.mentionAll === false
+              ? '群开关「允许 @所有人」没开：只会存成普通文字'
+              : '群开关状态宿主未报告'
+        rows.push({ name: '所有人', insert: '@所有人', hint: gate })
+      }
+      var members = group !== null && Array.isArray(group.members) ? group.members : []
+      var named = {}
+      var counts = {}
+      members.forEach(function (member) {
+        var item = member !== null && typeof member === 'object' ? member : {}
+        var name = str(item.name, '')
+        if (name.length === 0) return
+        counts[name] = (counts[name] === undefined ? 0 : counts[name]) + 1
+      })
+      members.forEach(function (member) {
+        var item = member !== null && typeof member === 'object' ? member : {}
+        var name = str(item.name, '')
+        if (name.length === 0 || named[name] === true) return
+        if (q !== '' && name.toLowerCase().indexOf(q) < 0) return
+        named[name] = true
+        var notes = []
+        if (counts[name] > 1) notes.push('重名：@ 会同时叫醒')
+        else if (item.isHuman === true) notes.push('用户')
+        else notes.push(str(MENTION_KIND_TEXT[str(item.kind, '')], str(item.kind, '成员')))
+        if (item.enabled === false) notes.push('休眠中，不会被叫醒')
+        rows.push({ name: name, insert: '@' + name, hint: notes.join(' · ') })
+      })
+      var total = rows.length
+      return { rows: rows.slice(0, MAX_MENTION_ROWS), total: total, omitted: Math.max(0, total - MAX_MENTION_ROWS) }
+    }
+
     /** The panel body. */
     function GroupPanel() {
       var [state, setState] = useState({
@@ -827,6 +967,11 @@ window.__ModuleLoader__.load({
         linkTargets: [],
       })
       var [draft, setDraft] = useState('')
+      // The mention list is DERIVED from the draft on every render (see
+      // mentionCandidates), so these two are only the highlight and the Esc
+      // dismissal — no second copy of "what is open" that could drift.
+      var [mentionIndex, setMentionIndex] = useState(0)
+      var [mentionMute, setMentionMute] = useState('')
       var [chosen, setChosen] = useState(null)
       var [tab, setTab] = useState('chat')
       var [creating, setCreating] = useState(false)
@@ -1021,6 +1166,20 @@ window.__ModuleLoader__.load({
             return again()
           })
           .catch(fail)
+      }
+
+      /**
+       * Complete the mention being typed with an exact member name.
+       *
+       * It replaces `@` plus whatever followed it, so the stored message carries
+       * the name the router will actually match — a near-miss would be stored as
+       * plain text and address nobody, silently.
+       */
+      function pickMention(context, candidate) {
+        if (context === null || context === undefined || candidate === undefined) return
+        setDraft(draft.slice(0, context.start) + candidate.insert + ' ')
+        setMentionIndex(0)
+        setMentionMute('')
       }
 
       /** A person must be able to start a room without asking an agent. */
@@ -1795,6 +1954,15 @@ window.__ModuleLoader__.load({
               '.jsonl 里。'
             : ''
 
+        // R3 in the panel: typing `@` offers the room's names. Derived from the
+        // draft, so the list the person sees and the text that will be sent can
+        // never disagree.
+        var mention = mentionQuery(draft)
+        var mentionList = mention === null ? { rows: [], total: 0, omitted: 0 } : mentionCandidates(group, mention.query)
+        var mentionKey = mention === null ? '' : mention.start + ':' + mention.query
+        var mentionRows = mention !== null && mentionMute === mentionKey ? [] : mentionList.rows
+        var mentionSelected = mentionRows.length === 0 ? 0 : Math.min(mentionIndex, mentionRows.length - 1)
+
         var head = h(
           'div',
           { style: S.head },
@@ -1901,22 +2069,88 @@ window.__ModuleLoader__.load({
             postNote !== '' ? h('div', { style: Object.assign({}, S.noteLine, { opacity: 1 }) }, postNote) : null,
             h(
               'div',
-              { style: S.composer },
-              h('input', {
-                style: S.input,
-                value: draft,
-                placeholder: '以「用户」身份发言（@名字 会记进消息，但不会叫醒任何人）',
-                onChange: function (event) {
-                  setDraft(event.target.value)
-                },
-                onKeyDown: function (event) {
-                  if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault()
-                    submit()
-                  }
-                },
-              }),
-              h('button', { style: S.button, onClick: submit }, '发送'),
+              { style: S.composerWrap },
+              mentionRows.length > 0
+                ? h(
+                    'div',
+                    { style: S.mentionList, 'aria-label': '选择要 @ 的人' },
+                    mentionRows.map(function (row, index) {
+                      return h(
+                        'div',
+                        {
+                          key: row.insert,
+                          style: index === mentionSelected ? S.mentionRowActive : S.mentionRow,
+                          onClick: function () {
+                            pickMention(mention, row)
+                          },
+                        },
+                        h('span', { style: S.mentionName }, row.name),
+                        row.hint === '' ? null : h('span', { style: S.mentionHint }, row.hint),
+                      )
+                    }),
+                    mentionList.omitted > 0
+                      ? h(
+                          'div',
+                          { style: S.mentionNote },
+                          '还有 ' + mentionList.omitted + ' 个没列出来（共 ' + mentionList.total + ' 个）：继续打字可以筛。',
+                        )
+                      : null,
+                  )
+                : null,
+              h(
+                'div',
+                { style: S.composer },
+                h('textarea', {
+                  style: S.composerInput,
+                  value: draft,
+                  // Grows with the draft up to six lines, then scrolls. Pure
+                  // arithmetic, so it is testable and needs no DOM measurement.
+                  rows: Math.min(6, Math.max(1, draft.split('\n').length)),
+                  placeholder: '以「用户」身份发言（Enter 发送，Shift+Enter 换行，打 @ 点名；不会叫醒任何人）',
+                  onChange: function (event) {
+                    setDraft(event.target.value)
+                    setMentionIndex(0)
+                  },
+                  onKeyDown: function (event) {
+                    var native = event.nativeEvent === null || event.nativeEvent === undefined ? {} : event.nativeEvent
+                    // A Chinese IME sends Enter to COMMIT a candidate. Sending the
+                    // message there would eat the person's text mid-word, so a
+                    // composing Enter is never a send.
+                    if (event.isComposing === true || native.isComposing === true || event.keyCode === 229) return
+                    if (mentionRows.length > 0) {
+                      if (event.key === 'ArrowDown') {
+                        event.preventDefault()
+                        setMentionIndex((mentionSelected + 1) % mentionRows.length)
+                        return
+                      }
+                      if (event.key === 'ArrowUp') {
+                        event.preventDefault()
+                        setMentionIndex((mentionSelected - 1 + mentionRows.length) % mentionRows.length)
+                        return
+                      }
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        setMentionMute(mentionKey)
+                        return
+                      }
+                      if (event.key === 'Enter' || event.key === 'Tab') {
+                        event.preventDefault()
+                        pickMention(mention, mentionRows[mentionSelected])
+                        return
+                      }
+                      return
+                    }
+                    // Shift+Enter is the newline, exactly like the rest of DSH;
+                    // plain Enter sends. The textarea is what makes the newline
+                    // possible at all — an <input> cannot hold one.
+                    if (event.key === 'Enter' && event.shiftKey !== true) {
+                      event.preventDefault()
+                      submit()
+                    }
+                  },
+                }),
+                h('button', { style: S.button, onClick: submit }, '发送'),
+              ),
             ),
           )
         } else {
