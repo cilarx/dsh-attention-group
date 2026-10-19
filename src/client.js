@@ -434,6 +434,31 @@ window.__ModuleLoader__.load({
         padding: '8px',
         boxSizing: 'border-box',
       },
+      // 2026-10-19, from a real screen recording: the room list costs the chat
+      // ~230px of width. Folded away it stays a 26px strip that still shows the
+      // direction of the fold — the rooms come back with one click.
+      listClosed: {
+        width: '26px',
+        flex: '0 0 26px',
+        borderRight: '1px solid rgba(127,127,127,.22)',
+        padding: '8px 2px',
+        boxSizing: 'border-box',
+        overflow: 'hidden',
+      },
+      listToggle: {
+        display: 'block',
+        width: '100%',
+        padding: '2px 0 6px',
+        border: 0,
+        background: 'transparent',
+        color: 'inherit',
+        cursor: 'pointer',
+        font: 'inherit',
+        fontSize: '12px',
+        lineHeight: '1.4',
+        opacity: 0.7,
+      },
+      listHidden: { display: 'none' },
       listItem: {
         display: 'block',
         width: '100%',
@@ -490,8 +515,35 @@ window.__ModuleLoader__.load({
         borderBottomColor: 'transparent',
       },
       scroll: { flex: '1 1 auto', overflowY: 'auto', padding: '10px 14px', minHeight: 0 },
-      row: { marginBottom: '10px' },
-      meta: { fontSize: '11px', opacity: 0.65, marginBottom: '2px' },
+      // The transcript and its 「jump to latest」 button share this box: the
+      // button must float OVER the scrolled text, not push the text up.
+      logWrap: { position: 'relative', flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 },
+      jumpButton: {
+        position: 'absolute',
+        right: '16px',
+        bottom: '12px',
+        width: '30px',
+        height: '30px',
+        borderRadius: '50%',
+        border: '1px solid rgba(127,127,127,.4)',
+        background: 'rgba(127,127,127,.55)',
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: '12px',
+        lineHeight: '1',
+        padding: 0,
+        boxShadow: '0 1px 4px rgba(0,0,0,.25)',
+      },
+      row: { marginBottom: '12px' },
+      // 2026-10-19: the speaker is what a human looks for while scrolling, so the
+      // NAME is blue and normal-sized (13px = the panel's base font) instead of a
+      // smaller grey label. The seq/time stay small and grey. `#4d6bfe` stays a
+      // literal: it is the one accent this panel is allowed to use (c22).
+      meta: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '6px', marginBottom: '3px' },
+      metaTail: { fontSize: '11px', opacity: 0.65 },
+      sender: { color: '#4d6bfe', fontSize: '13px', fontWeight: 500 },
       text: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
       // The composer is a COLUMN: the mention list sits above the box and pushes
       // it up rather than floating over the transcript. An overlay would need an
@@ -1066,6 +1118,54 @@ window.__ModuleLoader__.load({
       return parts.join('；')
     }
 
+    /**
+     * Pure helpers behind the transcript's scroll policy.
+     *
+     * The panel polls every 5 s, and EVERY poll used to force the log to the
+     * bottom — a human scrolling back through history was yanked away even when
+     * nothing new had arrived (reported 2026-10-19 from a screen recording).
+     * These functions hold the whole decision so `node --test` can pin it
+     * without a browser: `follow` = "move to the bottom", `notify` = "unseen
+     * messages arrived, light the button up".
+     */
+    function maxSeqOf(rows) {
+      var list = Array.isArray(rows) ? rows : []
+      var max = 0
+      for (var index = 0; index < list.length; index += 1) {
+        var row = list[index]
+        var seq = row !== null && typeof row === 'object' ? row.seq : null
+        if (typeof seq === 'number' && isFinite(seq) && seq > max) max = seq
+      }
+      return max
+    }
+
+    /** True when the reader is close enough to the bottom to count as "following". */
+    function nearBottom(box) {
+      if (box === null || box === undefined) return true
+      var remaining = box.scrollHeight - box.scrollTop - box.clientHeight
+      return !(typeof remaining === 'number' && remaining > 24)
+    }
+
+    function planScroll(input) {
+      var roomChanged = input.roomChanged === true
+      var prevSeq = typeof input.prevSeq === 'number' ? input.prevSeq : null
+      var nextSeq = typeof input.nextSeq === 'number' ? input.nextSeq : 0
+      var atBottom = roomChanged === true ? true : input.atBottom === true
+      var grew = prevSeq !== null && nextSeq > prevSeq
+      return {
+        roomChanged: roomChanged,
+        atBottom: atBottom,
+        // Opening a room starts at its newest message; otherwise only a reader
+        // who was ALREADY at the bottom gets followed. Scrolling up is a
+        // deliberate act and the panel must not undo it.
+        follow: roomChanged === true || (grew === true && atBottom === true),
+        // New messages while the reader is up in history: leave the view alone,
+        // light the 「jump to latest」 button instead.
+        notify: grew === true && atBottom === false,
+        nextSeq: nextSeq,
+      }
+    }
+
     /** The panel body. */
     function GroupPanel() {
       var [state, setState] = useState({
@@ -1144,6 +1244,18 @@ window.__ModuleLoader__.load({
       var [readNote, setReadNote] = useState('')
       var [roomGone, setRoomGone] = useState('')
       var logRef = useRef(null)
+      // ── transcript scroll state (2026-10-19) ────────────────────────────────
+      // `listOpen` folds the room list away; `unseen`/`flash` drive the
+      // 「jump to latest」 button (white = nothing waiting, blue/white blink =
+      // new messages). The refs mirror the state so effect bodies can read them
+      // without re-running the effect that owns them.
+      var [listOpen, setListOpen] = useState(true)
+      var [unseen, setUnseen] = useState(false)
+      var [flash, setFlash] = useState(false)
+      var atBottomRef = useRef(true)
+      var lastSeqRef = useRef(null)
+      var roomIdRef = useRef(null)
+      var unseenRef = useRef(false)
       // C-03: only the newest read may paint the screen.
       var latest = useRef(0)
       // C-13: one write per control at a time (see writeOnce).
@@ -1229,10 +1341,69 @@ window.__ModuleLoader__.load({
       useEffect(
         function () {
           var node = logRef.current
-          if (node) node.scrollTop = node.scrollHeight
+          var roomId = state.group === null ? null : state.group.id
+          var plan = planScroll({
+            roomChanged: roomIdRef.current !== roomId,
+            prevSeq: lastSeqRef.current,
+            nextSeq: maxSeqOf(state.messages),
+            atBottom: atBottomRef.current,
+          })
+          // No node means this panel is not in a browser (the test harness): the
+          // DECISION is still computed, it just has nothing to move.
+          if (plan.follow === true && node !== null && node !== undefined) {
+            node.scrollTop = node.scrollHeight
+          }
+          if (plan.roomChanged === true) roomIdRef.current = roomId
+          atBottomRef.current = plan.atBottom
+          lastSeqRef.current = plan.nextSeq
+          if (plan.notify !== unseenRef.current) {
+            unseenRef.current = plan.notify
+            setUnseen(plan.notify)
+          }
         },
-        [state.messages],
+        [state.messages, state.group],
       )
+
+      // Blink 「jump to latest」 between blue and white while messages wait.
+      // 600 ms: visible, but slow enough not to strobe.
+      useEffect(
+        function () {
+          if (unseen !== true) {
+            if (flash === true) setFlash(false)
+            return undefined
+          }
+          var id = setInterval(function () {
+            setFlash(function (value) {
+              return value !== true
+            })
+          }, 600)
+          return function () {
+            clearInterval(id)
+          }
+        },
+        [unseen],
+      )
+
+      function onLogScroll() {
+        var node = logRef.current
+        if (node === null || node === undefined) return
+        var near = nearBottom(node)
+        atBottomRef.current = near
+        if (near === true && unseenRef.current === true) {
+          unseenRef.current = false
+          setUnseen(false)
+        }
+      }
+
+      function jumpToLatest() {
+        var node = logRef.current
+        if (node !== null && node !== undefined) node.scrollTop = node.scrollHeight
+        atBottomRef.current = true
+        if (unseenRef.current === true) {
+          unseenRef.current = false
+          setUnseen(false)
+        }
+      }
 
       function fail(error) {
         setState(function (prev) {
@@ -1942,7 +2113,23 @@ window.__ModuleLoader__.load({
 
       var list = h(
         'div',
-        { style: S.list },
+        { style: listOpen === true ? S.list : S.listClosed },
+        h(
+          'button',
+          {
+            type: 'button',
+            style: S.listToggle,
+            'aria-label': listOpen === true ? '收起群聊列表' : '展开群聊列表',
+            title: listOpen === true ? '收起群聊列表，给聊天记录让出宽度' : '展开群聊列表：群名 + 未读数',
+            onClick: function () {
+              setListOpen(!listOpen)
+            },
+          },
+          listOpen === true ? '◀' : '▶',
+        ),
+        h(
+          'div',
+          { style: listOpen === true ? {} : S.listHidden },
         // A failed read must never look like an empty room. A 404 panel reading
         // as "you have no groups yet" is exactly what cost two debugging rounds
         // on 2026-10-16, so the failure is stated where the list would be.
@@ -2044,6 +2231,7 @@ window.__ModuleLoader__.load({
                 item.lastPreview ? h('div', { style: S.itemMeta }, str(item.lastFrom, '?') + '：' + str(item.lastPreview, '')) : null,
               )
             }),
+        ),
       )
 
       var body
@@ -2171,7 +2359,10 @@ window.__ModuleLoader__.load({
             degradedNote !== '' ? h('div', { style: S.notice }, degradedNote) : null,
             h(
               'div',
-              { style: S.scroll, ref: logRef },
+              { style: S.logWrap },
+              h(
+                'div',
+                { style: S.scroll, ref: logRef, onScroll: onLogScroll },
               truncatedNote !== '' ? h('div', { style: S.fieldHint }, truncatedNote) : null,
               // C-01: an unreadable transcript must never be drawn as an empty
               // room — 「这个群还没有消息。」 for a file that could not be read is
@@ -2189,11 +2380,24 @@ window.__ModuleLoader__.load({
                       h(
                         'div',
                         { style: S.meta },
-                        '#' + str(message.seq, '?') + '  ' + stampOf(message.at) + '  ' + str(message.fromName, '?'),
+                        h('span', { style: S.metaTail }, '#' + str(message.seq, '?') + '  ' + stampOf(message.at)),
+                        h('span', { style: S.sender }, str(message.fromName, '?')),
                       ),
                       h('div', { style: S.text }, str(message.text, '')),
                     )
                   }),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  'aria-label': '跳到最新消息',
+                  title: unseen === true ? '有新消息，点这里回到最新' : '回到最新消息',
+                  style: Object.assign({}, S.jumpButton, { color: unseen === true && flash === true ? '#4d6bfe' : '#fff' }),
+                  onClick: jumpToLatest,
+                },
+                '▼',
+              ),
             ),
             h(
               'div',
@@ -2968,6 +3172,10 @@ window.__ModuleLoader__.load({
 
     var exports = {}
     exports.inject = ['slots']
+    // Test seam: pure helpers only (no state, no host access). The module loader
+    // reads `inject` and `apply` and ignores anything else, so this keeps the
+    // scroll policy directly unit-testable instead of hoping a browser checks it.
+    exports.__test = { maxSeqOf: maxSeqOf, nearBottom: nearBottom, planScroll: planScroll }
     exports.apply = function (ctx) {
       // The sidebar button. Its id addresses the main panel below, so the two
       // must agree; a fresh id adds an entry rather than replacing a shipped one.

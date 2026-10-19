@@ -1309,3 +1309,96 @@ test("the panel's @所有人 tokens cannot drift from the host router's list", a
   }
   assert.deepEqual(tokensIn(SOURCE), tokensIn(routerSource), 'client.js and router.js must agree on @所有人')
 })
+
+// ── 2026-10-19: reading a busy room ──────────────────────────────────────────
+// Three complaints from the person using the panel every day: speakers were
+// indistinguishable from the text, the room list ate the transcript's width,
+// and scrolling back through history got snapped to the bottom on every poll.
+
+test('the speaker name is a blue label at normal size, not a small grey one', async () => {
+  const panel = await openChat()
+  const senders = findAll(
+    panel.tree,
+    (node) => node?.props?.style?.color === '#4d6bfe' && textOf(node) === '甲',
+  )
+  assert.ok(senders.length > 0, 'the speaker needs a label of its own')
+  const sender = senders[0]
+  assert.equal(sender.props.style.fontSize, '13px', 'the panel base size — the same size as the message text')
+  assert.equal(sender.props.style.opacity, undefined, 'the name must not inherit a faded label style')
+  // The seq/time tail stays small and grey, so the blue name is the only thing
+  // competing for attention on that line.
+  assert.match(textOf(panel.tree), /#2\s/)
+})
+
+test('the room list folds to a 26px strip and comes back with its rooms', async () => {
+  const panel = await boot()
+  const openList = () => findAll(panel.tree, (node) => node?.props?.style?.flex === '0 0 230px')[0]
+  assert.ok(openList() !== undefined, 'the list is open on first paint')
+
+  panel.click(findButton(panel.tree, '◀'))
+  await panel.settle()
+  assert.ok(
+    findAll(panel.tree, (node) => node?.props?.style?.flex === '0 0 26px')[0] !== undefined,
+    'a folded list keeps a 26px strip so it can be found again',
+  )
+  assert.ok(findButton(panel.tree, '▶') !== undefined, 'a triangle folds it back open')
+  // The rooms are HIDDEN, not thrown away: unfolding must not need a new read.
+  assert.ok(
+    findAll(panel.tree, (node) => node?.props?.style?.display === 'none').length > 0,
+    'the folded body is hidden, not unmounted',
+  )
+
+  panel.click(findButton(panel.tree, '▶'))
+  await panel.settle()
+  assert.ok(openList() !== undefined, 'the rooms come back')
+})
+
+test('opening a room starts at its newest message, and only then', async () => {
+  const panel = await boot()
+  const { planScroll } = panel.mod.__test
+  const opened = planScroll({ roomChanged: true, prevSeq: 9, nextSeq: 2, atBottom: false })
+  assert.equal(opened.follow, true, 'a freshly opened room shows its latest message')
+  assert.equal(opened.atBottom, true)
+})
+
+test('a poll that brings nothing never moves a reader who scrolled up', async () => {
+  const panel = await boot()
+  const { planScroll } = panel.mod.__test
+  const idle = planScroll({ roomChanged: false, prevSeq: 7, nextSeq: 7, atBottom: false })
+  assert.equal(idle.follow, false, 'the same messages must not yank the view')
+  assert.equal(idle.notify, false)
+})
+
+test('a new message while reading history is announced, not scrolled to', async () => {
+  const panel = await boot()
+  const { planScroll } = panel.mod.__test
+  const arrived = planScroll({ roomChanged: false, prevSeq: 7, nextSeq: 9, atBottom: false })
+  assert.equal(arrived.follow, false, 'the view stays where the human put it')
+  assert.equal(arrived.notify, true, 'the jump button has to say something arrived')
+
+  const following = planScroll({ roomChanged: false, prevSeq: 7, nextSeq: 9, atBottom: true })
+  assert.equal(following.follow, true, 'a reader already at the bottom is followed')
+  assert.equal(following.notify, false)
+})
+
+test('nearBottom gives the reader 24px of slack before calling it "up in history"', async () => {
+  const { nearBottom } = (await boot()).mod.__test
+  assert.equal(nearBottom({ scrollHeight: 1000, scrollTop: 700, clientHeight: 300 }), true)
+  assert.equal(nearBottom({ scrollHeight: 1000, scrollTop: 500, clientHeight: 300 }), false)
+})
+
+test('a 「jump to latest」 circle floats over the transcript, white until something waits', async () => {
+  const panel = await openChat()
+  const jump = findAll(panel.tree, (node) => node?.props?.['aria-label'] === '跳到最新消息')[0]
+  assert.ok(jump !== undefined, 'the human needs a way back to the newest message')
+  assert.equal(jump.type, 'button')
+  assert.equal(jump.props.style.position, 'absolute', 'it must float over the text, not push it')
+  assert.equal(jump.props.style.color, '#fff', 'nothing waiting: the triangle stays white')
+
+  // Jumping is a scroll, not a write.
+  const before = panel.requests.length
+  panel.click(jump)
+  await panel.settle()
+  assert.equal(panel.requests.length, before, 'jumping must not talk to the host')
+})
+

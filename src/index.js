@@ -60,7 +60,7 @@ const name = 'attention-group'
  */
 const inject = ['agents', 'tools']
 
-const VERSION = '0.1.0'
+const VERSION = '0.1.1'
 
 /**
  * Wrap human-readable lines as typed content blocks.
