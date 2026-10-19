@@ -177,6 +177,62 @@ test('the summary button refuses clearly when the room cannot produce one', asyn
   assert.equal(host.delivered.length, 0, 'and nothing may be woken on the refusal path')
 })
 
+test('a member can be promoted to 群管理 from the panel, and that unblocks the summary', async () => {
+  boot()
+  const groupId = await newRoom('提拔群管理群')
+  const memberId = 'session-bbbb2222-3333-4444-5555-666677778888'
+  // A plain session member: the room has no 群管理 yet, so the button refuses.
+  await post({ action: 'join', group: groupId, memberId, memberName: '乙' })
+  const before = await post({ action: 'summaryGenerate', group: groupId })
+  assert.equal(before.status, 400)
+  assert.match(before.json.error, /群管理/)
+
+  const promoted = await post({ action: 'memberKind', group: groupId, memberId, kind: 'admin' })
+  assert.equal(promoted.status, 200)
+  assert.equal(promoted.json.kind, 'admin')
+  const member = ledgerOnDisk()
+    .groups.find((row) => row.id === groupId)
+    .members.find((row) => row.id === memberId)
+  assert.equal(member.kind, 'admin', 'the promotion must be durable, not just acknowledged')
+
+  // The gate that refused a minute ago now refuses for the OTHER reason: the
+  // room's waking switch is still off. That proves the admin gate was passed.
+  const after = await post({ action: 'summaryGenerate', group: groupId })
+  assert.equal(after.status, 400)
+  assert.match(after.json.error, /唤醒/)
+})
+
+test('promoting a non-session id is refused, and an unknown kind names the legal ones', async () => {
+  boot()
+  const groupId = await newRoom('非会话群管理群')
+  await post({ action: 'join', group: groupId, memberId: 'bot-1', memberName: '机器人', kind: 'bot' })
+
+  const refused = await post({ action: 'memberKind', group: groupId, memberId: 'bot-1', kind: 'admin' })
+  assert.equal(refused.status, 400)
+  assert.match(refused.json.error, /真实的 DSH 会话/, 'only a session can write a summary back')
+
+  const bad = await post({ action: 'memberKind', group: groupId, memberId: 'bot-1', kind: 'wizard' })
+  assert.equal(bad.status, 400)
+  assert.match(bad.json.error, /session/, 'a refusal has to name the legal values')
+  assert.equal(
+    ledgerOnDisk().groups.find((row) => row.id === groupId).members.find((row) => row.id === 'bot-1').kind,
+    'bot',
+    'a refused promotion must not change the record',
+  )
+})
+
+test('an action the host does not know is refused, not posted as a message', async () => {
+  // 2026-10-20: the panel gained 「设为群管理」 (action `memberKind`). Against a host
+  // from BEFORE the restart that click would fall through to the "post as the
+  // human" default and write junk into the room. Unknown actions now refuse.
+  boot()
+  const groupId = await newRoom('未知动作群')
+  const res = await post({ action: 'promoteToSomething', group: groupId, text: '这条不该进群记录' })
+  assert.equal(res.status, 400)
+  assert.match(res.json.error, /unknown action/)
+  assert.equal(host.messagesOnDisk(groupId), '', 'a refused action must not write a message')
+})
+
 test('@所有人 is inert until the room allows it, and then it addresses the whole room', async () => {
   boot()
   const groupId = await newRoom('全体广播群')

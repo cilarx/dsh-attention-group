@@ -1827,6 +1827,21 @@ window.__ModuleLoader__.load({
           .catch(fail)
       }
 
+      /**
+       * Change what kind of member this is. The one kind that really matters is
+       * `admin`: it is the member a 群史摘要 is written BY, so a room without one
+       * has a 「生成群史摘要」 button that can only refuse (2026-10-20).
+       */
+      function setMemberKind(member, kind) {
+        if (state.group === null) return
+        var body = { action: 'memberKind', group: state.group.id, memberId: member.id, kind: kind }
+        writeOnce('member-kind:' + String(member.id), function () {
+          return act(body)
+        })
+          .then(again)
+          .catch(fail)
+      }
+
       function toggleMemberEnabled(member) {
         if (state.group === null) return
         var body = { action: 'member', group: state.group.id, memberId: member.id, enabled: member.enabled === false }
@@ -2245,6 +2260,29 @@ window.__ModuleLoader__.load({
       } else {
         var group = state.group
         var links = Array.isArray(group.links) ? group.links : []
+        // 2026-10-20: a 群史摘要 is written BY a 群管理, and the host refuses the
+        // click when the room has none. The panel therefore has to (a) say who
+        // the 群管理 is right where the button is, and (b) offer the one click
+        // that creates one — otherwise the human sees an error with no way out.
+        var memberList = Array.isArray(group.members) ? group.members : []
+        var adminMembers = memberList.filter(function (member) {
+          return (
+            member !== null &&
+            typeof member === 'object' &&
+            member.kind === 'admin' &&
+            member.enabled !== false &&
+            member.isHuman !== true
+          )
+        })
+        var promoteCandidates = memberList.filter(function (member) {
+          return (
+            member !== null &&
+            typeof member === 'object' &&
+            member.kind === 'session' &&
+            member.enabled !== false &&
+            member.isHuman !== true
+          )
+        })
         var routeOption = knobOption(knobs.routeModes, group.routeMode)
         var routeLabel = knobText(knobs.routeModes, group.routeMode)
         var routeHint = routeOption === null ? '' : str(routeOption.hint, '')
@@ -2512,7 +2550,7 @@ window.__ModuleLoader__.load({
                 'div',
                 { style: S.memberTop },
                 h('span', { style: S.memberName, title: str(item.name, str(item.id, '')) }, str(item.name, str(item.id, '（没有 id 的成员）'))),
-                h('span', { style: S.tag }, str(item.kind, 'session')),
+                h('span', { style: S.tag }, str(MENTION_KIND_TEXT[item.kind], str(item.kind, 'session'))),
                 h('span', { style: S.tag }, item.wakeable === true ? '可唤醒' : '只记录'),
                 item.enabled === false ? h('span', { style: S.tag }, '已休眠') : null,
                 item.enabled === undefined ? h('span', { style: S.tag }, '启用状态未报告') : null,
@@ -2532,6 +2570,22 @@ window.__ModuleLoader__.load({
                         },
                         item.enabled === false ? '启用' : '休眠',
                       ),
+                      item.isHuman === true || (item.kind !== 'session' && item.kind !== 'admin')
+                        ? null
+                        : h(
+                            'button',
+                            {
+                              style: S.ghost,
+                              title:
+                                item.kind === 'admin'
+                                  ? '取消群管理：它不再负责写群史摘要'
+                                  : '设为群管理：群史摘要由它用自己的模型写，再在群里用 attention_record_summary 写回',
+                              onClick: function () {
+                                setMemberKind(item, item.kind === 'admin' ? 'session' : 'admin')
+                              },
+                            },
+                            item.kind === 'admin' ? '取消群管理' : '设为群管理',
+                          ),
                       item.isHuman === true
                         ? null
                         : h(
@@ -2815,6 +2869,44 @@ window.__ModuleLoader__.load({
                         )
                       : null,
                   ),
+                  h(
+                    'div',
+                    { style: S.fieldHint },
+                    adminMembers.length > 0
+                      ? '群管理（摘要由它写）：' +
+                          adminMembers
+                            .map(function (member) {
+                              return str(member.name, '?')
+                            })
+                            .join('、')
+                      : '这个群还没有群管理 —— 摘要必须由一个真实的 DSH 会话用自己的模型写，所以先在下面把它设上。',
+                  ),
+                  adminMembers.length > 0
+                    ? null
+                    : h(
+                        'div',
+                        { style: S.memberRow },
+                        promoteCandidates.length === 0
+                          ? h('div', { style: S.fieldHint }, '群里还没有可设为群管理的会话成员：先到「成员」里拉一个 Agent 进群。')
+                          : [
+                              h('span', { style: S.fieldHint }, '把谁设为群管理：'),
+                            ].concat(
+                              promoteCandidates.map(function (member) {
+                                return h(
+                                  'button',
+                                  {
+                                    key: 'promote-' + String(member.id),
+                                    style: S.ghost,
+                                    title: '设为群管理：群史摘要由它用自己的模型写，再在群里用 attention_record_summary 写回',
+                                    onClick: function () {
+                                      setMemberKind(member, 'admin')
+                                    },
+                                  },
+                                  str(member.name, str(member.id, '?')),
+                                )
+                              }),
+                            ),
+                      ),
                   h(
                     'div',
                     { style: S.fieldHint },
@@ -3135,7 +3227,7 @@ window.__ModuleLoader__.load({
                               },
                             },
                             (Array.isArray(knobs.memberKinds) ? knobs.memberKinds : []).map(function (kind) {
-                              return h('option', { key: kind, value: kind }, kind)
+                              return h('option', { key: kind, value: kind }, str(MENTION_KIND_TEXT[kind], kind))
                             }),
                           ),
                           h('button', { style: S.button, onClick: addMember }, '拉进来'),

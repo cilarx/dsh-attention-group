@@ -1402,3 +1402,57 @@ test('a 「jump to latest」 circle floats over the transcript, white until some
   assert.equal(panel.requests.length, before, 'jumping must not talk to the host')
 })
 
+// ── 2026-10-20: the 群史摘要 button needs a 群管理, and the panel must say so ──
+// The human pressed 「生成群史摘要」 and got "no usable 群管理 member" with nowhere
+// to click. The host's refusal was honest; the panel was the silent failure.
+
+test('the summary section names the 群管理, and promotes one when the room has none', async () => {
+  // P群's admin member is DISABLED in the fixture, so this room has no usable
+  // 群管理 — exactly the state the human hit.
+  const panel = await openSettings()
+  const shown = textOf(panel.tree)
+  assert.match(shown, /还没有群管理/, 'the panel has to explain why the button will refuse')
+
+  const promote = findAll(panel.tree, (node) => node.type === 'button' && textOf(node) === '甲')[0]
+  assert.ok(
+    promote !== undefined,
+    'and offer the click that creates one — panel says: ' + textOf(panel.tree),
+  )
+  panel.click(promote)
+  await panel.settle()
+  const posted = panel.posts().filter((row) => row.action === 'memberKind')
+  assert.equal(posted.length, 1, 'promoting is one durable action')
+  assert.equal(posted[0].memberId, JIA)
+  assert.equal(posted[0].kind, 'admin')
+  assert.equal(posted[0].group, P_ID)
+})
+
+test('a room that already has a live 群管理 says who writes the summary', async () => {
+  const panel = await boot({
+    patchDetail: (detail) => ({
+      ...detail,
+      members: detail.members.map((member) =>
+        member.id === 'room-admin' ? { ...member, enabled: true, kind: 'admin', name: '群管理' } : member,
+      ),
+    }),
+  })
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  assert.match(textOf(panel.tree), /群管理（摘要由它写）：群管理/)
+  // With a usable admin the panel does not offer the promotion list.
+  assert.equal(findButton(panel.tree, '把谁设为群管理'), undefined)
+})
+
+test('a member row can promote a session to 群管理 without leaving the settings tab', async () => {
+  const panel = await openSettings()
+  const button = findAll(panel.tree, (node) => node.type === 'button' && textOf(node) === '设为群管理')[0]
+  assert.ok(button !== undefined, 'every session member row needs the same verb')
+  panel.click(button)
+  await panel.settle()
+  assert.equal(panel.posts().filter((row) => row.action === 'memberKind').length, 1)
+  // The member-type tag is in Chinese now: 「会话」/「群管理」, not a raw `admin`.
+  assert.match(textOf(panel.tree), /会话/)
+})
+

@@ -60,7 +60,7 @@ const name = 'attention-group'
  */
 const inject = ['agents', 'tools']
 
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 
 /**
  * Wrap human-readable lines as typed content blocks.
@@ -3775,7 +3775,7 @@ async function applyPanelAction(state, body) {
     if (summarizer === undefined) {
       return {
         ok: false,
-        error: '这个群还没有可用的群管理成员：需要 kind=admin 且本身是 DSH 会话，摘要由它来写',
+        error: '这个群还没有可用的群管理成员：需要 kind=admin 且本身是 DSH 会话，摘要由它来写。到 设置 → 成员 里点某个会话的「设为群管理」即可',
       }
     }
     if (group.wakeEnabled !== true) {
@@ -3961,8 +3961,36 @@ async function applyPanelAction(state, body) {
     return done({ memberId, name: member.name, enabled: member.enabled !== false })
   }
 
-  if (action === 'leave') {
+  // 2026-10-20: a room needs a 群管理 to write group-history summaries, and the
+  // panel had no way to CREATE one — the button just refused with "no usable
+  // admin member" and the human had nowhere to click. Promoting is the missing
+  // verb. It is its own action rather than a field on `member` because demoting
+  // an admin by accident is how a room loses its summarizer (see the `join`
+  // comment above), so the value is validated and the intent is explicit.
+  if (action === 'memberKind') {
     const memberId = String(body?.memberId ?? '').trim()
+    const member = group.members.find((candidate) => candidate.id === memberId)
+    if (member === undefined) return { ok: false, error: `unknown member "${memberId}"` }
+    const kind = body?.kind
+    if (!PANEL_KNOBS.memberKinds.includes(kind)) {
+      return { ok: false, error: `kind must be one of ${PANEL_KNOBS.memberKinds.join(' / ')}` }
+    }
+    // A 群管理 writes the summary with ITS OWN model and calls
+    // attention_record_summary from ITS OWN session. A non-session id (a bot, a
+    // relay target) can do neither, so promoting it would only move the failure
+    // from the click to the wake-up.
+    if (kind === 'admin' && !isSessionId(memberId)) {
+      return {
+        ok: false,
+        error: '群管理只能是一个真实的 DSH 会话成员：摘要要它用自己的模型写，并在群里调 attention_record_summary 写回',
+      }
+    }
+    member.kind = kind
+    save()
+    return done({ memberId, kind, name: member.name })
+  }
+
+  if (action === 'leave') {    const memberId = String(body?.memberId ?? '').trim()
     if (memberId.length === 0) return { ok: false, error: 'memberId is required' }
     const before = group.members.length
     group.members = group.members.filter((member) => member.id !== memberId)
@@ -3984,6 +4012,14 @@ async function applyPanelAction(state, body) {
     member.lastReadAt = new Date().toISOString()
     save()
     return done({ lastReadAt: member.lastReadAt, joined })
+  }
+
+  // An action this host does not know must NEVER fall through to "post a message
+  // as the human". 2026-10-20: the panel gained 「设为群管理」 (action
+  // `memberKind`); against a host from before the restart, this arrival would
+  // have posted the click's payload as a chat message instead of refusing.
+  if (action !== 'post') {
+    return { ok: false, error: `unknown action "${action}"` }
   }
 
   // Default: post a message as the human.
