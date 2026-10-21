@@ -793,3 +793,74 @@ test('the picker lists sessions with title, workspace and last activity, and mar
     picker.cleanup()
   }
 })
+
+// ── 2026-10-21: R9++ — summarise without a 群管理, and show the room's size ──
+
+test('without a model service the direct summary refuses and names the fallback', async () => {
+  boot()
+  const groupId = await newRoom('无模型群')
+  await post({ action: 'post', group: groupId, text: '一条消息' })
+  const res = await post({ action: 'summaryDirect', group: groupId })
+  assert.equal(res.status, 400)
+  assert.match(res.json.error, /llm/)
+  assert.match(res.json.error, /叫醒群管理/, 'the refusal must name the path that still works')
+})
+
+test('a direct summary calls the deployment model, stores the text, and wakes nobody', async () => {
+  const direct = await createHost({
+    model: { provider: 'deepseek', model: 'deepseek-chat', reply: '## 摘要\n- 结论一：记录已压缩' },
+  })
+  try {
+    direct.boot()
+    const groupId = await direct.newRoom('直接摘要群')
+    await direct.post({
+      action: 'join',
+      group: groupId,
+      memberId: 'session-cccc3333-4444-5555-6666-777788889999',
+      memberName: '丁',
+    })
+    await direct.post({ action: 'post', group: groupId, text: '一条需要被摘要的消息' })
+
+    const before = direct.delivered.length
+    const res = await direct.post({ action: 'summaryDirect', group: groupId })
+    assert.equal(res.status, 200)
+    assert.equal(res.json.ok, true)
+    assert.equal(res.json.mode, 'direct')
+    assert.match(res.json.summarizerName, /deepseek/, 'the human is told which model wrote it')
+    assert.equal(direct.delivered.length, before, 'a direct summary must not start a turn in any session')
+    assert.equal(direct.modelCalls.length, 1, 'exactly one model call')
+    assert.equal(direct.modelCalls[0].provider, 'deepseek')
+    assert.match(String(direct.modelCalls[0].messages?.[0]?.content?.[0]?.text), /一条需要被摘要的消息/)
+
+    const group = direct.ledgerOnDisk().groups.find((row) => row.id === groupId)
+    assert.equal(group.summaries.length, 1)
+    assert.match(group.summaries[0].text, /结论一/)
+    assert.equal(group.summaries[0].by, '部署模型 deepseek/deepseek-chat')
+
+    // Clicking again with nothing new refuses instead of spending a call.
+    const againRes = await direct.post({ action: 'summaryDirect', group: groupId })
+    assert.equal(againRes.status, 400)
+    assert.match(againRes.json.error, /没有未摘要的消息/)
+    assert.equal(direct.modelCalls.length, 1, 'a refusal must not call the model')
+  } finally {
+    direct.cleanup()
+  }
+})
+
+test('the room read model reports transcript size for the dashboard', async () => {
+  boot()
+  const groupId = await newRoom('仪表盘群')
+  await post({ action: 'post', group: groupId, text: '一二三四五六七八九十' })
+
+  const detail = await get(`?group=${groupId}`)
+  const stats = detail.json.group.stats
+  assert.ok(stats !== undefined, 'the detail read must carry stats')
+  assert.ok(stats.messages >= 1)
+  assert.ok(stats.chars > 0, 'characters are what the estimate is priced from')
+  assert.ok(stats.estTokens > 0)
+
+  const list = await get('')
+  const row = list.json.groups.find((candidate) => candidate.id === groupId)
+  assert.equal(typeof row.estTokens, 'number', 'the list carries the estimate so the dashboard can show every room')
+  assert.ok(row.estTokens > 0)
+})

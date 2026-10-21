@@ -1,6 +1,6 @@
 {
   "name": "dsh-attention-group",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A multi-agent group chat for DSH that decides who is worth waking: durable message log, attention routing, and cross-workspace membership.",
   "type": "module",
   "license": "MIT",

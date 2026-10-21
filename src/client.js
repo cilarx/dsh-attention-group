@@ -161,6 +161,20 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Compact token/char count for the dashboard: 950 / 12.3k / 1.2M.
+     *
+     * These numbers are ESTIMATES (see `roomStats` on the host). Every place that
+     * renders one says 「估算」 next to it, so the number can never be mistaken
+     * for a bill.
+     */
+    function bigCount(value) {
+      if (!countKnown(value) || value < 0) return '—'
+      if (value < 1000) return String(Math.round(value))
+      if (value < 1000 * 1000) return (value / 1000).toFixed(value < 100000 ? 1 : 0) + 'k'
+      return (value / 1000000).toFixed(1) + 'M'
+    }
+
+    /**
      * Text safe to hand to React as a child.
      *
      * A knob table that arrives malformed must not be able to blank the page:
@@ -1771,6 +1785,35 @@ window.__ModuleLoader__.load({
           })
       }
 
+      /**
+       * R9++ (2026-10-21, user request): summarise with the deployment's own
+       * model — no 群管理 session, no turn woken anywhere. The host does the
+       * model call; the panel only reports what came back.
+       */
+      function generateSummaryDirect() {
+        if (state.group === null) return
+        setSummaryNote('正在用部署模型生成摘要…')
+        act({ action: 'summaryDirect', group: state.group.id })
+          .then(function (data) {
+            setSummaryNote(
+              '已生成摘要（' +
+                countOf(data.messages) +
+                ' 条 → ' +
+                countOf(data.chars) +
+                ' 字，覆盖到第 ' +
+                countOf(data.upToSeq) +
+                ' 条），写入者：' +
+                str(data.summarizerName, '部署模型') +
+                (Number.isFinite(data.tokens) ? '，本次约 ' + countOf(data.tokens) + ' tokens' : ''),
+            )
+            return again()
+          })
+          .catch(function (error) {
+            setSummaryNote('')
+            fail(error)
+          })
+      }
+
       function generateSummary() {
         if (state.group === null) return
         setSummaryNote('已请求，等群管理写回…')
@@ -2218,6 +2261,8 @@ window.__ModuleLoader__.load({
               // whole point of degrading instead of failing the request. It just
               // has to SAY it is degraded.
               var metaParts = [countOf(item.memberCount) + ' 人', countOf(item.messages) + ' 条']
+              // Dashboard: the room's transcript size at a glance in the list.
+              if (countKnown(item.estTokens)) metaParts.push('≈' + bigCount(item.estTokens) + ' tok')
               if (!countKnown(item.memberCount) || !countKnown(item.messages)) metaParts.push('宿主未报告计数')
               if (item.wakeEnabled === true) metaParts.push('唤醒开')
               else if (item.wakeEnabled !== false) metaParts.push('唤醒未报告')
@@ -2352,7 +2397,10 @@ window.__ModuleLoader__.load({
                 ' 条 · 路由 ' +
                 routeLabel +
                 ' · 强度 ' +
-                effortLabel,
+                effortLabel +
+                (group.stats !== undefined && group.stats !== null && countKnown(group.stats.estTokens)
+                  ? ' · 记录 ≈' + bigCount(group.stats.estTokens) + ' tok'
+                  : ''),
             ),
           ),
           h(
@@ -2868,6 +2916,30 @@ window.__ModuleLoader__.load({
                           '已有 ' + countOf(group.summary.count) + ' 份摘要，最新覆盖到第 ' + countOf(group.summary.upToSeq) + ' 条',
                         )
                       : null,
+                  ),
+                  // 2026-10-21 (user request): one click, no 群管理 needed. The host
+                  // calls the deployment's own model; nobody's session is woken.
+                  h(
+                    'div',
+                    { style: S.memberRow },
+                    h('button', { style: Object.assign({}, S.button, { background: '#4d6bfe' }), onClick: generateSummaryDirect }, '直接生成摘要（不叫醒任何人）'),
+                    h(
+                      'div',
+                      { style: S.fieldHint },
+                      '用部署默认模型读本群记录并写摘要，写回群记录；不叫醒任何会话，也不需要群管理。',
+                    ),
+                  ),
+                  h(
+                    'div',
+                    { style: S.fieldHint },
+                    '记录占用估算：' +
+                      countOf(group.stats && group.stats.messages) +
+                      ' 条 · ' +
+                      bigCount(group.stats && group.stats.chars) +
+                      ' 字符 ≈ ' +
+                      bigCount(group.stats && group.stats.estTokens) +
+                      ' tokens（估算，只用于看量级，不是账单）' +
+                      (group.summary ? '；未摘要 ' + countOf(group.summary.pending) + ' 条' : ''),
                   ),
                   h(
                     'div',

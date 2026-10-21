@@ -61,6 +61,8 @@ export async function createHost(options = {}) {
   const workspaces = Array.isArray(options.workspaces) ? options.workspaces : []
   const effortCalls = []
   const delivered = []
+  const modelCalls = []
+  const model = options.model ?? undefined
   if (!existsSync(pluginEntry)) {
     throw new Error(`the plugin entry is missing: ${pluginEntry}`)
   }
@@ -241,6 +243,31 @@ export async function createHost(options = {}) {
             },
           }
         }
+        // 2026-10-21: R9++ summarises through the DEPLOYMENT's model service.
+        // These two stubs model the real pair the plugin asks for: `llm.stream`
+        // (adapter holds the credentials — the plugin passes no key) and
+        // `agentDefaultModel.currentSelection()` (provider/model).
+        if (name === 'llm' && model !== undefined) {
+          return {
+            async *stream(request) {
+              modelCalls.push({ provider: request.provider, model: request.model, system: request.system, messages: request.messages })
+              yield { type: 'block-start', index: 0, blockType: 'text' }
+              yield { type: 'text-delta', index: 0, text: String(model.reply ?? '摘要正文') }
+              yield {
+                type: 'usage',
+                usage: { inputTokens: Number(model.inputTokens ?? 300), outputTokens: Number(model.outputTokens ?? 40) },
+              }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            },
+          }
+        }
+        if (name === 'agentDefaultModel' && model !== undefined) {
+          return {
+            currentSelection() {
+              return { provider: String(model.provider ?? 'deepseek'), model: String(model.model ?? 'deepseek-chat') }
+            },
+          }
+        }
         return undefined
       },
       inject(names, cb) {
@@ -365,6 +392,8 @@ export async function createHost(options = {}) {
     delivered,
     /** Every `sessionController.selectModel` call, oldest first. */
     effortCalls,
+    /** Every `llm.stream` call the plugin made, oldest first (R9++ direct summary). */
+    modelCalls,
     get home() {
       if (home.length === 0) {
         // Without this, `join(host.home, 'x')` silently yields a RELATIVE path and

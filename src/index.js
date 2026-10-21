@@ -60,7 +60,7 @@ const name = 'attention-group'
  */
 const inject = ['agents', 'tools']
 
-const VERSION = '0.1.2'
+const VERSION = '0.1.3'
 
 /**
  * Wrap human-readable lines as typed content blocks.
@@ -473,6 +473,96 @@ function summarizedUpTo(group) {
   }
   return upTo
 }
+
+/**
+ * Store one summary snapshot on the room (R9+). Shared by the tool
+ * (`attention_record_summary`) and the panel's direct generator, so both write
+ * the same shape and both refuse the same nonsense.
+ *
+ * @returns {{ok: true, record: object} | {ok: false, error: string}}
+ */
+function storeSummaryRecord(group, input) {
+  const text = typeof input?.text === 'string' ? input.text.trim() : ''
+  if (text.length === 0) return { ok: false, error: '摘要正文是空的' }
+  if (text.length > MAX_SUMMARY_CHARS) {
+    return { ok: false, error: `摘要 ${text.length} 字，超过上限 ${MAX_SUMMARY_CHARS} 字` }
+  }
+  const latestSeq = Number.isFinite(input?.latestSeq) ? input.latestSeq : 0
+  const already = summarizedUpTo(group)
+  const wanted = Number.isFinite(input?.upToSeq) ? Math.floor(input.upToSeq) : latestSeq
+  const upToSeq = Math.max(0, Math.min(wanted, latestSeq))
+  if (upToSeq <= already) return { ok: false, error: `没有新的内容：摘要已经覆盖到第 ${already} 条` }
+  const covered = Number.isFinite(input?.covered) ? input.covered : Math.max(0, upToSeq - already)
+  const record = {
+    upToSeq,
+    at: new Date().toISOString(),
+    by: String(input?.by ?? '摘要生成器'),
+    text,
+    covered,
+  }
+  if (!Array.isArray(group.summaries)) group.summaries = []
+  group.summaries.push(record)
+  return { ok: true, record }
+}
+
+/**
+ * Heuristic token price for one plain string, used ONLY for the panel's
+ * 「占用多少 token」 dashboard — never for billing and never to size a request.
+ *
+ * It is deliberately simple: CJK characters are ~1 token each and ASCII ~¼ token
+ * (4 characters), which is close for Chinese-heavy project chat logs. Every
+ * surface that shows it says 「估算」, because a wrong-but-labelled number is
+ * honest and an unlabelled one is a lie (c7).
+ */
+function estimateTextTokens(text) {
+  const value = typeof text === 'string' ? text : String(text ?? '')
+  let tokens = 0
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0
+    tokens += code > 0x7f ? 1 : 0.25
+  }
+  return Math.ceil(tokens)
+}
+
+/** Per-room transcript size, for the dashboard: characters, messages, est. tokens. */
+function roomStats(rows) {
+  let chars = 0
+  let tokens = 0
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const line = `${String(row?.fromName ?? '')}：${String(row?.text ?? '')}`
+    chars += line.length
+    tokens += estimateTextTokens(line) + 8
+  }
+  return { messages: Array.isArray(rows) ? rows.length : 0, chars, estTokens: tokens }
+}
+
+// R9++ (2026-10-21): direct summarisation through the deployment's own model.
+const MAX_SUMMARY_INPUT_CHARS = 12000
+const DIRECT_SUMMARY_SYSTEM =
+  '你是群聊记录压缩器。把用户给的一段群聊记录压成 300-800 字的中文摘要：只保留结论、决定、事实、待办与需要注意的坑；不逐句复述；不编造；不要客套话。'
+
+/** Compose the transcript one direct summary reads, newest-first when it must be capped. */
+function buildDirectSummaryInput(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  const lines = []
+  let omitted = 0
+  let used = 0
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const row = list[index] ?? {}
+    const line = `#${String(row.seq ?? '?')} ${String(row.at ?? '')} ${String(row.fromName ?? '?')}：${String(row.text ?? '')}`
+    if (used + line.length > MAX_SUMMARY_INPUT_CHARS) {
+      omitted += 1
+      continue
+    }
+    lines.push(line)
+    used += line.length
+  }
+  lines.reverse()
+  const text = lines.join('\n') + (omitted > 0 ? `\n（更早的 ${omitted} 条因输入长度上限未包含）` : '')
+  return { text, omitted }
+}
+
+
 
 /**
  * How long a computed unread count may be reused before it is recomputed.
@@ -3315,6 +3405,10 @@ function panelGroupRow(state, group) {
     id,
     title: typeof group?.title === 'string' ? group.title : '(untitled room)',
     messages: all.length,
+    // Dashboard (2026-10-21): how much transcript this room is carrying. `chars`
+    // and `estTokens` are ESTIMATES for the human to see the order of magnitude;
+    // the panel labels them 「估算」 and nothing bills from them.
+    ...roomStats(all),
     lastAt: newest === undefined ? '' : String(newest.at ?? ''),
     lastFrom: newest === undefined ? '' : String(newest.fromName ?? ''),
     lastPreview: newest === undefined ? '' : String(newest.text ?? '').replace(/\s+/gu, ' ').slice(0, 80),
@@ -3436,6 +3530,7 @@ function panelGroupDetail(state, group) {
       joinedAt: member.joinedAt,
     })),
     messageCount: all.length,
+    stats: roomStats(all),
     // Newest-last, capped: the panel scrolls, and a room with years of history
     // must not become one enormous response. `truncated` has always been sent
     // and was never read — 305 messages drew 300 rows and said nothing.
@@ -3828,6 +3923,83 @@ async function applyPanelAction(state, body) {
       delivered: outcome.delivered === true,
       path: outcome.path,
       ...(outcome.note === undefined ? {} : { note: outcome.note }),
+    }
+  }
+
+  // 2026-10-21 (user request): summarise WITHOUT needing a 群管理 session.
+  //
+  // R9's first design made an admin session write the summary, because the
+  // plugin must not own model credentials (c24). The runtime now exposes a model
+  // service (`ctx.llm`) whose adapters hold the DEPLOYMENT's credentials — so one
+  // completion can be requested without the plugin storing any key of its own.
+  //
+  // Result: one deliberate click, no turn in anybody's session, no admin needed.
+  // Kept as a SEPARATE action from `summaryGenerate` so the session path remains
+  // available (and remains the fallback where the model service is absent).
+  if (action === 'summaryDirect') {
+    const llm = typeof state.ctx.get === 'function' ? state.ctx.get('llm') : undefined
+    const defaults = typeof state.ctx.get === 'function' ? state.ctx.get('agentDefaultModel') : undefined
+    if (llm === undefined || defaults === undefined) {
+      return {
+        ok: false,
+        error: '这个部署没有可用的模型服务（llm / agentDefaultModel），无法不叫醒任何人就生成摘要；请改用「叫醒群管理生成」',
+      }
+    }
+    const selection = typeof defaults.currentSelection === 'function' ? defaults.currentSelection() : undefined
+    const provider = typeof selection?.provider === 'string' ? selection.provider : ''
+    const model = typeof selection?.model === 'string' ? selection.model : ''
+    if (provider.length === 0 || model.length === 0) {
+      return { ok: false, error: '读不到部署的默认模型（provider / model）' }
+    }
+    const all = readMessages(state.root, group.id, { limit: 0 })
+    const latestSeq = all.reduce((max, row) => (Number.isFinite(row.seq) && row.seq > max ? row.seq : max), 0)
+    const from = summarizedUpTo(group)
+    const slice = all.filter((row) => Number.isFinite(row.seq) && row.seq > from)
+    if (slice.length === 0) {
+      return { ok: false, error: `这个群没有未摘要的消息（已有摘要覆盖到第 ${from} 条），不需要生成` }
+    }
+    const input = buildDirectSummaryInput(slice)
+    let reply = ''
+    let usage
+    try {
+      for await (const chunk of llm.stream({
+        provider,
+        model,
+        system: DIRECT_SUMMARY_SYSTEM,
+        messages: [{ role: 'user', content: [{ type: 'text', text: input.text }] }],
+        maxTokens: 1200,
+      })) {
+        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') reply += chunk.text
+        if (chunk?.type === 'usage') usage = chunk.usage
+        if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') {
+          throw new Error(chunk.reason.failure?.message ?? 'model call failed')
+        }
+      }
+    } catch (error) {
+      return { ok: false, error: `模型调用失败：${errorMessage(error)}` }
+    }
+    const stored = storeSummaryRecord(group, {
+      text: reply,
+      latestSeq,
+      by: `部署模型 ${provider}/${model}`,
+      covered: slice.length,
+    })
+    if (stored.ok !== true) return { ok: false, error: stored.error }
+    save()
+    return {
+      ok: true,
+      mode: 'direct',
+      summarizer: `${provider}/${model}`,
+      summarizerName: `${provider}/${model}（部署默认模型）`,
+      messages: slice.length,
+      upToSeq: latestSeq,
+      covered: stored.record.covered,
+      chars: stored.record.text.length,
+      inputChars: input.text.length,
+      inputOmitted: input.omitted,
+      ...(usage === undefined
+        ? {}
+        : { tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), usage }),
     }
   }
 

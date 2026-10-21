@@ -1456,3 +1456,34 @@ test('a member row can promote a session to 群管理 without leaving the settin
   assert.match(textOf(panel.tree), /会话/)
 })
 
+// ── 2026-10-21: R9++ direct summary + the transcript-size dashboard ──────────
+
+test('the summary section offers a direct summary that needs no 群管理', async () => {
+  const panel = await openSettings()
+  const button = findButton(panel.tree, '直接生成摘要（不叫醒任何人）')
+  assert.ok(button !== undefined, 'the human asked for a button that needs no admin')
+  panel.click(button)
+  await panel.settle()
+  const posted = panel.posts().filter((row) => row.action === 'summaryDirect')
+  assert.equal(posted.length, 1, 'one deliberate click, one model call on the host')
+  assert.equal(posted[0].group, P_ID)
+  assert.match(textOf(panel.tree), /已生成摘要|模型/, 'the result has to come back to the human')
+})
+
+test('the room shows its transcript size, labelled as an estimate', async () => {
+  const panel = await boot({
+    patchDetail: (detail) => ({
+      ...detail,
+      stats: { messages: 73, chars: 18234, estTokens: 12345 },
+    }),
+  })
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  // The header line is visible while reading, not only in settings.
+  assert.match(textOf(panel.tree), /记录 ≈12\.3k tok/)
+  panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  assert.match(textOf(panel.tree), /记录占用估算/)
+  assert.match(textOf(panel.tree), /估算/, 'the number must say it is an estimate, never a bill')
+})
+
