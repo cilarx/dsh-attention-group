@@ -62,7 +62,13 @@ the command exits 0, DSH initializes the profile, and the package lands with all
 source files, its bundle patch and its `cordis.patch.yml`.
 
 The bare-name form `dsh plugin --profile desktop add dsh-attention-group` does **not** resolve
-yet, because there is no npm release. Use the `github:` form above.
+yet, because there is no npm release. Use the `github:` form above, or the
+[latest release tarball](https://github.com/cilarx/dsh-attention-group/releases/latest):
+
+```bash
+# download dsh-attention-group-0.1.4.tgz from the release page, then:
+dsh plugin --profile desktop add "C:\path\to\dsh-attention-group-0.1.4.tgz"
+```
 
 Any of a directory path, a tarball, or a git URL works, because `dsh plugin` **is** package
 management: it delegates to `pnpm` in the profile directory (run `dsh plugin --profile <name>`
@@ -84,7 +90,7 @@ Installing by path works too, and a packed tarball is verified end to end:
 
 ```bash
 npm pack --pack-destination /tmp
-dsh plugin --profile some-fresh-name add /tmp/dsh-attention-group-0.1.0.tgz
+dsh plugin --profile some-fresh-name add /tmp/dsh-attention-group-0.1.4.tgz
 # → dsh: initialized profile some-fresh-name at ~/.dsh/profiles/some-fresh-name
 ```
 

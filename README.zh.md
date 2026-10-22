@@ -58,7 +58,13 @@ dsh plugin --profile desktop add github:cilarx/dsh-attention-group
 装出来的包里 7 个源文件、bundle patch、`cordis.patch.yml` 全在。
 
 裸包名那一条（`dsh plugin --profile desktop add dsh-attention-group`）**现在还解析不了**，因为
-没有 npm 发布。请用上面的 `github:` 形式。
+没有 npm 发布。请用上面的 `github:` 形式，或者用
+[最新 Release 的 tarball](https://github.com/cilarx/dsh-attention-group/releases/latest)：
+
+```bash
+# 从 Release 页下载 dsh-attention-group-0.1.4.tgz，然后：
+dsh plugin --profile desktop add "C:\下载目录\dsh-attention-group-0.1.4.tgz"
+```
 
 目录路径、tarball、git URL 都行，因为 `dsh plugin` **本身就是**包管理：它在 profile 目录里把命令
 交给 `pnpm`（不带子命令跑一次 `dsh plugin --profile <名字>`，回给你的就是 pnpm 自己的帮助）。让它
@@ -78,7 +84,7 @@ dsh plugin --profile desktop add github:cilarx/dsh-attention-group
 
 ```bash
 npm pack --pack-destination /tmp
-dsh plugin --profile 一个全新名字 add /tmp/dsh-attention-group-0.1.0.tgz
+dsh plugin --profile 一个全新名字 add /tmp/dsh-attention-group-0.1.4.tgz
 # → dsh: initialized profile 一个全新名字 at ~/.dsh/profiles/一个全新名字
 ```
 
