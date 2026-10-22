@@ -290,6 +290,31 @@ export function renderWakeMessage(input) {
     lines.push(charter.length > MAX_CHARTER ? `${charter.slice(0, MAX_CHARTER)} …（群规过长，此处截断）` : charter)
   }
 
+  // 2026-10-22 (user request): a woken member must be able to catch up CHEAPLY.
+  // Without this, the only way to learn what the room had been discussing was
+  // `attention_history` — which pulls the tail into context. The latest summary
+  // is already stored; put it right here, capped, so a member that was away does
+  // not need to read 70 messages to answer one.
+  if (group.wakeSummary !== false) {
+    const stored = Array.isArray(group.summaries)
+      ? group.summaries.filter(
+          (row) => row !== null && typeof row === 'object' && typeof row.text === 'string' && row.text.trim().length > 0,
+        )
+      : []
+    const latest = stored.length > 0 ? stored[stored.length - 1] : undefined
+    if (latest !== undefined) {
+      const MAX_WAKE_SUMMARY = 1200
+      const summaryText = latest.text.trim()
+      lines.push('')
+      lines.push(`【这个群之前聊过什么（摘要，覆盖到第 ${Number.isFinite(latest.upToSeq) ? latest.upToSeq : 0} 条）】`)
+      lines.push(
+        summaryText.length > MAX_WAKE_SUMMARY
+          ? `${summaryText.slice(0, MAX_WAKE_SUMMARY)} …（摘要过长，此处截断）`
+          : summaryText,
+      )
+    }
+  }
+
   lines.push('')
   lines.push(message.text)
   lines.push('')

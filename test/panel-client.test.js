@@ -1487,3 +1487,47 @@ test('the room shows its transcript size, labelled as an estimate', async () => 
   assert.match(textOf(panel.tree), /估算/, 'the number must say it is an estimate, never a bill')
 })
 
+// ── 2026-10-22: the summary is visible, and the wake carries it ──────────────
+
+test('the settings page shows the latest summary text, not just a count', async () => {
+  const panel = await boot({
+    patchDetail: (detail) => ({
+      ...detail,
+      wakeSummary: true,
+      summary: {
+        every: 500,
+        upToSeq: 60,
+        latestSeq: 73,
+        pending: 13,
+        count: 1,
+        latestText: '前 60 条：文档已交付。',
+        latestBy: '部署模型',
+      },
+    }),
+  })
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  assert.match(textOf(panel.tree), /前 60 条：文档已交付。/)
+})
+
+test('the wake-summary switch is on the settings page and posts a real action', async () => {
+  const panel = await boot({
+    patchDetail: (detail) => ({ ...detail, wakeSummary: true }),
+  })
+  panel.click(findButton(panel.tree, 'P群'))
+  await panel.settle()
+  panel.click(findButton(panel.tree, '设置'))
+  await panel.settle()
+  const field = cardContaining(panel.tree, '唤醒时附上摘要')
+  assert.ok(field !== undefined, 'the switch has to be discoverable')
+  const button = findAll(field, (node) => node.type === 'button')[0]
+  assert.ok(button !== undefined, 'the field must own a switch')
+  panel.click(button)
+  await panel.settle()
+  const posted = panel.posts().filter((row) => row.action === 'wakeSummary')
+  assert.equal(posted.length, 1)
+  assert.equal(posted[0].wakeSummary, false)
+})
+

@@ -60,7 +60,7 @@ const name = 'attention-group'
  */
 const inject = ['agents', 'tools']
 
-const VERSION = '0.1.3'
+const VERSION = '0.1.4'
 
 /**
  * Wrap human-readable lines as typed content blocks.
@@ -2216,6 +2216,11 @@ function registerTools(ctx, state) {
       parameters: {
         groupId: { type: 'string', required: true },
         limit: { type: 'number', description: 'How many of the newest messages to return. Default 20.' },
+        compact: {
+          type: 'boolean',
+          description:
+            'Read CHEAPLY: return the latest stored summary plus only the messages after it, instead of the whole tail. Use this to catch up on a long room without pulling every message into context.',
+        },
       },
       output: {
         schema: {
@@ -2225,6 +2230,19 @@ function registerTools(ctx, state) {
             ok: { type: 'boolean', required: true },
             groupId: { type: 'string' },
             total: { type: 'number' },
+            mode: { type: 'string' },
+            summary: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                text: { type: 'string' },
+                upToSeq: { type: 'number' },
+                at: { type: 'string' },
+              },
+            },
+            summaryMissing: { type: 'boolean' },
+            afterSummary: { type: 'number' },
+            note: { type: 'string' },
             messages: {
               type: 'array',
               required: true,
@@ -2245,14 +2263,29 @@ function registerTools(ctx, state) {
         },
         render: (_args, value) => {
           if (value.ok !== true) return textBlock(`failed: ${value.error ?? 'unknown error'}`)
-          const header = `${value.groupId}: ${value.messages.length} of ${value.total} message(s)`
+          const header =
+            value.mode === 'compact'
+              ? `${value.groupId}: compact view — summary + ${value.messages.length} of ${value.afterSummary ?? 0} message(s) after it (log has ${value.total})`
+              : `${value.groupId}: ${value.messages.length} of ${value.total} message(s)`
           const all = value.messages.map((row) => `#${row.seq} ${row.at} <${row.fromName}> ${row.text}`)
           // Keep the NEWEST lines when the cap bites: the tail is what a wake-up
           // hint refers to, and the notice states how much was dropped. The
           // budget is explicit so the header and the notice always fit.
           const budget = MAX_RENDER_LINES - 1
           const kept = all.slice(Math.max(0, all.length - budget))
-          const lines = [header, ...kept]
+          const lines = [header]
+          // R9+++ 2026-10-22: in compact mode the SUMMARY leads, capped so the
+          // tool result stays a fraction of the log it replaces.
+          if (value.mode === 'compact') {
+            if (value.summary !== undefined && typeof value.summary.text === 'string') {
+              lines.push(`【摘要（覆盖到第 ${value.summary.upToSeq ?? '?'} 条）】`)
+              for (const row of value.summary.text.split('\n').slice(0, 60)) lines.push(row)
+            } else {
+              lines.push(`【还没有摘要】${value.note ?? ''}`)
+            }
+            lines.push('— 摘要之后的消息 —')
+          }
+          lines.push(...kept)
           if (kept.length < all.length) {
             while (lines.length >= MAX_RENDER_LINES) lines.splice(1, 1)
             lines.splice(1, 0, `… ${all.length - (lines.length - 1)} older line(s) omitted from this view; the log keeps everything`)
@@ -2284,6 +2317,42 @@ function registerTools(ctx, state) {
         if (reader !== undefined && all.length > 0) {
           reader.lastReadAt = all[all.length - 1].at
           commit()
+        }
+        // 2026-10-22 (user request): catching up must not mean reading everything.
+        // `compact` answers with the latest stored summary plus ONLY the messages
+        // after it — the whole point of keeping summaries in the first place.
+        if (args.compact === true) {
+          const upToSeq = summarizedUpTo(group)
+          const stored = groupSummaries(group)
+          const latest = stored.length > 0 ? stored[stored.length - 1] : undefined
+          const after = all.filter((row) => !(Number.isFinite(row.seq) && row.seq <= upToSeq))
+          return {
+            ok: true,
+            groupId: group.id,
+            total: all.length,
+            mode: 'compact',
+            ...(latest === undefined
+              ? { summaryMissing: true }
+              : {
+                  summary: {
+                    text: latest.text,
+                    upToSeq: Number.isFinite(latest.upToSeq) ? latest.upToSeq : 0,
+                    ...(typeof latest.at === 'string' ? { at: latest.at } : {}),
+                  },
+                }),
+            afterSummary: after.length,
+            note:
+              latest === undefined
+                ? '这个群还没有摘要，所以只能返回最近的消息；用 attention_summarize 或请人在面板点「直接生成摘要」建立摘要后，compact 读就只返回摘要 + 新消息。'
+                : `摘要覆盖到第 ${Number.isFinite(latest.upToSeq) ? latest.upToSeq : 0} 条；下面是之后的 ${after.length} 条。`,
+            messages: after.slice(-limit).map((row) => ({
+              seq: row.seq,
+              at: row.at,
+              fromName: row.fromName,
+              text: row.text,
+              mentions: Array.isArray(row.mentions) ? row.mentions : [],
+            })),
+          }
         }
         return {
           ok: true,
@@ -3486,6 +3555,10 @@ function panelGroupDetail(state, group) {
     // R6: when this is on, a member sees "群聊未读：…" in its own system prompt on
     // every step, so it learns about waiting messages even when nobody woke it.
     promptUnread: group.promptUnread === true,
+    // 2026-10-22: a woken member should not have to pull the whole log to catch
+    // up. When this is on (default), the wake-up message carries the latest
+    // summary before the triggering message. Off = the old behaviour.
+    wakeSummary: group.wakeSummary !== false,
     // R3+: may a member address the whole room with `@所有人`? Off by default: a
     // room where everyone can wake everyone is a room nobody can afford.
     mentionAll: group.mentionAll === true,
@@ -3505,6 +3578,12 @@ function panelGroupDetail(state, group) {
         pending: Math.max(0, latestSeq - upToSeq),
         count: stored.length,
         ...(last !== undefined && typeof last.at === 'string' ? { lastAt: last.at } : {}),
+        // 2026-10-22: the panel can finally SHOW the summary it kept counting.
+        // Capped: a stored summary is already ≤8000 chars, and this rides on
+        // every read of one room — it must not become the biggest field here.
+        ...(last !== undefined && typeof last.text === 'string'
+          ? { latestText: last.text.slice(0, 4000), latestBy: typeof last.by === 'string' ? last.by : '' }
+          : {}),
       }
     })(),
     // R10: where this room relays to, and what each link is willing to carry.
@@ -3840,6 +3919,12 @@ async function applyPanelAction(state, body) {
     group.promptUnread = body?.promptUnread === true
     save()
     return done({ promptUnread: group.promptUnread })
+  }
+
+  if (action === 'wakeSummary') {
+    group.wakeSummary = body?.wakeSummary === true
+    save()
+    return done({ wakeSummary: group.wakeSummary })
   }
 
   if (action === 'mentionAll') {

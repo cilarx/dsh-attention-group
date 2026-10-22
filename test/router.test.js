@@ -336,3 +336,39 @@ test('an @所有人 message addresses every other member, and the plan says why'
   })
   assert.equal(plain.silent, true, 'the phrase alone must not wake anybody')
 })
+
+// ── 2026-10-22: a woken member gets the room's summary, not just one message ──
+
+test('a wake message carries the latest summary so the member need not read the log', () => {
+  const text = renderWakeMessage({
+    group: group({
+      summaries: [
+        { upToSeq: 40, at: '2026-10-21T00:00:00.000Z', by: '部署模型', text: '前 40 条：大家决定先做插件，再做文档。', covered: 40 },
+        { upToSeq: 60, at: '2026-10-22T00:00:00.000Z', by: '部署模型', text: '前 60 条：文档已交付，下一步做发布。', covered: 20 },
+      ],
+    }),
+    message: { fromName: 'Bob', text: '发布前要不要再测一遍？', seq: 61, at: '2026-10-22T00:05:00.000Z' },
+    reason: REASON.mention,
+  })
+  assert.match(text, /【这个群之前聊过什么（摘要，覆盖到第 60 条）】/, 'the summary must be stated, with how far it reaches')
+  assert.match(text, /文档已交付，下一步做发布/)
+  assert.doesNotMatch(text, /前 40 条：大家决定先做插件/, 'only the LATEST summary belongs in a wake message')
+  // The triggering message is still there, after the summary.
+  assert.match(text, /发布前要不要再测一遍/)
+})
+
+test('wakeSummary off restores the old one-message wake, and no summary means no block', () => {
+  const off = renderWakeMessage({
+    group: group({ wakeSummary: false, summaries: [{ upToSeq: 60, text: '摘要正文' }] }),
+    message: { fromName: 'Bob', text: '你好', seq: 61 },
+    reason: REASON.mention,
+  })
+  assert.doesNotMatch(off, /这个群之前聊过什么/)
+
+  const none = renderWakeMessage({
+    group: group(),
+    message: { fromName: 'Bob', text: '你好', seq: 1 },
+    reason: REASON.mention,
+  })
+  assert.doesNotMatch(none, /这个群之前聊过什么/, 'a room with no summary must not get an empty heading')
+})

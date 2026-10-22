@@ -849,3 +849,44 @@ test('A-10: a period that is not a date is refused, not answered as "no messages
   const good = await callTool(tools, 'attention_digest', { groupId: created.groupId, since: '2026-10-16T00:00:00.000Z' }, agentA)
   assert.equal(good.ok, true)
 })
+
+// ── 2026-10-22: cheap catch-up (the whole point of keeping summaries) ────────
+
+test('attention_history compact returns the latest summary plus only the messages after it', async () => {
+  const { tools } = fakeContext()
+  const created = await callTool(tools, 'attention_group_create', { title: 'compact 群' }, agentA)
+  const groupId = created.groupId
+  for (const text of ['第一条', '第二条', '第三条']) {
+    await callTool(tools, 'attention_send', { groupId, text }, agentA)
+  }
+  await callTool(tools, 'attention_record_summary', { groupId, text: '摘要：前两条讲了什么', upToSeq: 2 }, agentA)
+
+  const compact = await callTool(tools, 'attention_history', { groupId, compact: true }, agentA)
+  assert.equal(compact.mode, 'compact')
+  assert.equal(compact.summary.text, '摘要：前两条讲了什么')
+  assert.equal(compact.summary.upToSeq, 2)
+  assert.deepEqual(
+    compact.messages.map((row) => row.seq),
+    [3],
+    'compact read must return ONLY what the summary does not cover',
+  )
+  assert.equal(compact.afterSummary, 1)
+  assert.match(compact.note, /摘要覆盖到第 2 条/)
+
+  // Full mode is untouched: the switch must not change what a normal read means.
+  const full = await callTool(tools, 'attention_history', { groupId }, agentA)
+  assert.equal(full.messages.length, 3)
+  assert.equal(full.mode, undefined)
+})
+
+test('a compact read of a room with no summary says so instead of pretending', async () => {
+  const { tools } = fakeContext()
+  const created = await callTool(tools, 'attention_group_create', { title: '无摘要群' }, agentA)
+  await callTool(tools, 'attention_send', { groupId: created.groupId, text: '只有一条' }, agentA)
+
+  const compact = await callTool(tools, 'attention_history', { groupId: created.groupId, compact: true }, agentA)
+  assert.equal(compact.mode, 'compact')
+  assert.equal(compact.summaryMissing, true)
+  assert.equal(compact.messages.length, 1, 'without a summary the caller still gets the recent messages')
+  assert.match(compact.note, /还没有摘要/)
+})

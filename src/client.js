@@ -2859,6 +2859,23 @@ window.__ModuleLoader__.load({
               h(
                 Field,
                 {
+                  label: '唤醒时附上摘要',
+                  value: tri(group.wakeSummary),
+                  hint:
+                    '开：被叫醒的成员收到的消息里会带这个群「最近一份摘要」（截断到 1200 字），' +
+                    '这样它不必为了搞清上下文去读几十条历史；关：只发触发它的那一条。' +
+                    '成员也可以自己用 attention_history 的 compact 模式，只读「摘要 + 新消息」。',
+                },
+                h(Switch, {
+                  value: group.wakeSummary,
+                  onPick: function (value) {
+                    setKnob('wakeSummary', { wakeSummary: value })
+                  },
+                }),
+              ),
+              h(
+                Field,
+                {
                   label: '允许 @所有人',
                   value: tri(group.mentionAll),
                   hint:
@@ -2940,6 +2957,19 @@ window.__ModuleLoader__.load({
                       bigCount(group.stats && group.stats.estTokens) +
                       ' tokens（估算，只用于看量级，不是账单）' +
                       (group.summary ? '；未摘要 ' + countOf(group.summary.pending) + ' 条' : ''),
+                  ),
+                  // 2026-10-22: the summary was stored but never SHOWN. Show it.
+                  h(
+                    'div',
+                    null,
+                    h(
+                      'div',
+                      { style: S.fieldHint },
+                      '最新一份摘要（成员被叫醒时会附上它；成员也可以调用 attention_history 的 compact 模式只读「摘要 + 之后的原文」）：',
+                    ),
+                    group.summary !== undefined && group.summary !== null && typeof group.summary.latestText === 'string'
+                      ? h('pre', { style: S.digestBox }, group.summary.latestText)
+                      : h('div', { style: S.fieldHint }, '还没有摘要正文可显示。'),
                   ),
                   h(
                     'div',

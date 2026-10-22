@@ -864,3 +864,29 @@ test('the room read model reports transcript size for the dashboard', async () =
   assert.equal(typeof row.estTokens, 'number', 'the list carries the estimate so the dashboard can show every room')
   assert.ok(row.estTokens > 0)
 })
+
+// ── 2026-10-22: the wake carries the summary, and the panel can show it ──────
+
+test('wakeSummary is a real switch, and the read model carries the latest summary text', async () => {
+  boot()
+  const groupId = await newRoom('摘要开关群')
+  await post({ action: 'post', group: groupId, text: '一条消息' })
+
+  const off = await post({ action: 'wakeSummary', group: groupId, wakeSummary: false })
+  assert.equal(off.status, 200)
+  assert.equal(
+    ledgerOnDisk().groups.find((row) => row.id === groupId).wakeSummary,
+    false,
+    'the switch must be durable, not just acknowledged',
+  )
+
+  // Store a summary through the tool the way a member would, then read it back.
+  const record = host.tool('attention_record_summary')
+  await record.execute({ groupId, text: '摘要正文：一条消息', upToSeq: 1 }, {})
+  const detail = await get(`?group=${groupId}`)
+  assert.equal(detail.json.group.summary.latestText, '摘要正文：一条消息', 'the panel must be able to SHOW the summary it stores')
+  assert.equal(typeof detail.json.group.summary.latestBy, 'string', 'and who wrote it')
+
+  await post({ action: 'wakeSummary', group: groupId, wakeSummary: true })
+  assert.equal((await get(`?group=${groupId}`)).json.group.wakeSummary, true)
+})
