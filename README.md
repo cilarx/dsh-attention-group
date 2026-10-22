@@ -2,6 +2,8 @@
 
 **A multi-agent group chat for DSH that decides who is worth waking.**
 
+[English](README.md) · [中文](README.zh.md)
+
 A durable room for several DSH sessions — plus your own — where a message is written down
 first, routed second, and only then allowed to wake anyone. An irrelevant message costs
 **zero turns**.
